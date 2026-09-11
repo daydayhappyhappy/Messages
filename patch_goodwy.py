@@ -245,6 +245,74 @@ def patch_sdk_align(root, sdk):
         log("commons: compileSdk/targetSdk 已对齐为 %s" % sdk)
 
 
+def patch_ispro_always_true(root):
+    """把 Context.isPro() 直接改成 true —— 这是解锁所有付费 UI 最关键的一刀。
+
+    为什么比逐处改 if 判断强得多:
+      SettingsActivity 里有 alpha = if (pro) 1f else 0.4f(未解锁时变灰)、
+      addLockedLabelIfNeeded(未解锁时在标题后加"(已锁定)")、
+      if (isPro()) { 可点 } 等一大堆分支;
+      commons 的 CustomizationActivity 里 isProVersion() 也有十几个锁定分支。
+      isPro() 恒 true 后这些自动全部走解锁路径, 一行都不用改,
+      也不可能出现"改漏某一处"的情况。
+
+    注意 isProNoGP 仍要单独改 true(见 patch_baseconfig):
+      PurchaseActivity 里 proSwitch.isChecked 读的是 baseConfig.isProNoGP,
+      不是 isPro()。两个都要改, 否则开关显示还是关闭。
+    """
+    p = find_file(root, "commons/src/main/kotlin/com/goodwy/commons/extensions",
+                  "Context.kt")
+    if not p:
+        warn("找不到 commons Context.kt, 跳过 isPro 一刀切")
+        return
+    src = read(p)
+    if "fun Context.isPro() = true" in src:
+        log("commons: isPro() 已处理过, 跳过")
+        return
+    # isPro() 是表达式体函数(没有 {}), 一路延伸到下一个顶层声明之前
+    new, k = re.subn(
+        r'(?ms)^fun Context\.isPro\(\) =.*?(?=\n\S|\Z)',
+        'fun Context.isPro() = true  // 付费功能已全部解锁', src, count=1)
+    if k:
+        write(p, new)
+        log("commons: Context.isPro() 恒为 true "
+            "(锁定标签/变灰/自定义颜色等限制全部解除)")
+    else:
+        warn("commons: 未匹配到 Context.isPro() 定义")
+
+
+def patch_purchase_page(root):
+    """foss 渠道的 PurchaseActivity(项目支持页) 空壳化。
+
+    前提: 入口已全隐藏(购买卡片 + 小费罐), 且 isPro() 恒 true 不需要购买,
+    这个页面已经是死页面。空壳化后即使被残留调用也只是瞬间关闭, 不会崩。
+    想保留它(比如为了目视确认 UNLOCK 是开着的)就加 --keep-purchase-page。
+    """
+    p = os.path.join(root, "commons", "src", "foss", "kotlin",
+                     "com", "goodwy", "commons", "activities",
+                     "PurchaseActivity.kt")
+    if not os.path.exists(p):
+        hits = [q for q in walk_files(root, (".kt",))
+                if os.path.basename(q) == "PurchaseActivity.kt"]
+        if not hits:
+            log("commons: 未找到 foss PurchaseActivity, 跳过")
+            return
+        p = hits[0]
+    src = read(p)
+    if "购买页已精简" in src:
+        log("commons: PurchaseActivity 已处理过, 跳过")
+        return
+    new, ok = replace_fun_body(
+        src, r'override fun onCreate\(savedInstanceState: Bundle\?\)',
+        '\n        super.onCreate(savedInstanceState)\n'
+        '        finish()  // 购买页已精简\n    ')
+    if ok:
+        write(p, new)
+        log("commons: foss PurchaseActivity 已空壳化 (进入即关闭)")
+    else:
+        warn("commons: PurchaseActivity.onCreate 未匹配")
+
+
 def patch_constants(root, fmt):
     """把所有 DATE_FORMAT_XXX 常量统一成一个格式。
     Goodwy 的 commons 有 14 个常量(ONE..FOURTEEN), 不是 Fossify 的 8 个。"""
@@ -1568,6 +1636,8 @@ def main():
                     help="保留更新日志 / 新应用推荐 / 数据访问披露三类弹窗 (默认全部去掉)")
     ap.add_argument("--no-unlock-pro", action="store_true",
                     help="不解锁付费功能 (默认打开项目支持的 UNLOCK 开关)")
+    ap.add_argument("--keep-purchase-page", action="store_true",
+                    help="保留 foss 的项目支持页 (默认空壳化: 入口已隐藏且无需购买)")
     a = ap.parse_args()
     a.hide_datefmt = not a.no_hide_datefmt
     a.abi_trim = not a.no_abi_trim
@@ -1584,6 +1654,10 @@ def main():
         patch_commons_version(root, a.commons_version)
         if a.compile_sdk:
             patch_sdk_align(root, a.compile_sdk)
+        if not a.no_unlock_pro:
+            patch_ispro_always_true(root)
+            if not a.keep_purchase_page:
+                patch_purchase_page(root)
         patch_constants(root, a.date_format)
         patch_baseconfig(root, a.date_format, not a.no_unlock_pro)
         patch_longkt(root, a.date_mode)
