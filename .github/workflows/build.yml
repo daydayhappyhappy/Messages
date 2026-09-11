@@ -81,6 +81,10 @@ on:
         description: '保留 foss 的项目支持页 (默认勾 false = 空壳化, 因为入口已隐藏且无需购买)'
         type: boolean
         default: false
+      keep_speech:
+        description: '保留语音输入 (默认勾 false = 彻底删除: 设置项 + 麦克风按钮 + 长按 + 结果回填)'
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -152,6 +156,7 @@ jobs:
           if [ "${{ inputs.dialog_trim }}" != "true" ]; then FLAGS="$FLAGS --no-dialog-trim"; fi
           if [ "${{ inputs.unlock_pro }}" != "true" ]; then FLAGS="$FLAGS --no-unlock-pro"; fi
           if [ "${{ inputs.keep_purchase_page }}" = "true" ]; then FLAGS="$FLAGS --keep-purchase-page"; fi
+          if [ "${{ inputs.keep_speech }}" = "true" ]; then FLAGS="$FLAGS --keep-speech"; fi
           if [ "${{ inputs.italic_fix }}" != "true" ]; then FLAGS="$FLAGS --no-italic-fix"; fi
           LOCALES=""
           if [ -n "${{ inputs.locales }}" ]; then
@@ -193,6 +198,7 @@ jobs:
           if [ "${{ inputs.purchase_trim }}" != "true" ]; then FLAGS="$FLAGS --no-purchase-trim"; fi
           if [ "${{ inputs.google_trim }}" != "true" ]; then FLAGS="$FLAGS --no-google-trim"; fi
           if [ "${{ inputs.dialog_trim }}" != "true" ]; then FLAGS="$FLAGS --no-dialog-trim"; fi
+          if [ "${{ inputs.keep_speech }}" = "true" ]; then FLAGS="$FLAGS --keep-speech"; fi
           if [ "${{ inputs.italic_fix }}" != "true" ]; then FLAGS="$FLAGS --no-italic-fix"; fi
           PKGARG=""
           if [ -n "${{ inputs.package_name }}" ]; then
