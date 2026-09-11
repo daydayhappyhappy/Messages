@@ -69,6 +69,14 @@ on:
         description: '去掉签名认证弹窗 (否则自编译版会弹「应用已损坏, 请从商店重新下载」)'
         type: boolean
         default: true
+      dialog_trim:
+        description: '去掉更新日志 / 新应用推荐 / 数据访问披露三类弹窗, 并隐藏设置页「其他」分组'
+        type: boolean
+        default: true
+      unlock_pro:
+        description: '项目支持页的 UNLOCK 开关默认打开 (解锁自定义颜色等全部付费功能)'
+        type: boolean
+        default: true
 
 jobs:
   build:
@@ -135,6 +143,10 @@ jobs:
           FLAGS=""
           if [ "${{ inputs.trim_langs }}" != "true" ]; then FLAGS="$FLAGS --no-trim-langs"; fi
           if [ "${{ inputs.strip_about }}" != "true" ]; then FLAGS="$FLAGS --no-strip-about"; fi
+          if [ "${{ inputs.sideload_trim }}" != "true" ]; then FLAGS="$FLAGS --no-sideload-trim"; fi
+          if [ "${{ inputs.google_trim }}" != "true" ]; then FLAGS="$FLAGS --no-google-trim"; fi
+          if [ "${{ inputs.dialog_trim }}" != "true" ]; then FLAGS="$FLAGS --no-dialog-trim"; fi
+          if [ "${{ inputs.unlock_pro }}" != "true" ]; then FLAGS="$FLAGS --no-unlock-pro"; fi
           if [ "${{ inputs.italic_fix }}" != "true" ]; then FLAGS="$FLAGS --no-italic-fix"; fi
           LOCALES=""
           if [ -n "${{ inputs.locales }}" ]; then
@@ -175,6 +187,7 @@ jobs:
           if [ "${{ inputs.device_trim }}" != "true" ]; then FLAGS="$FLAGS --no-device-trim"; fi
           if [ "${{ inputs.purchase_trim }}" != "true" ]; then FLAGS="$FLAGS --no-purchase-trim"; fi
           if [ "${{ inputs.google_trim }}" != "true" ]; then FLAGS="$FLAGS --no-google-trim"; fi
+          if [ "${{ inputs.dialog_trim }}" != "true" ]; then FLAGS="$FLAGS --no-dialog-trim"; fi
           if [ "${{ inputs.italic_fix }}" != "true" ]; then FLAGS="$FLAGS --no-italic-fix"; fi
           PKGARG=""
           if [ -n "${{ inputs.package_name }}" ]; then
