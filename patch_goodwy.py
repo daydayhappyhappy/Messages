@@ -156,6 +156,36 @@ def fun_span(src, sig_pattern):
     return None
 
 
+def verify_syntax(root):
+    """补丁跑完后自检: 掩码掉注释与字符串, 检查 {} () [] 是否配平。
+
+    这道检查专治"把函数定义注释掉一半"这类灾难 —— 上一版就是这么把
+    `fun Activity.showSideloadingDialog() {` 注释成 `fun Activity.// ... {`,
+    编译期才炸, 浪费一整轮 CI。宁可多花几秒在这里报警。
+    """
+    bad = []
+    n = 0
+    for p in walk_files(root, (".kt", ".java", ".kts")):
+        try:
+            s = read(p)
+        except Exception:
+            continue
+        n += 1
+        m = _mask(s)
+        for op, cl in (("{", "}"), ("(", ")"), ("[", "]")):
+            d = m.count(op) - m.count(cl)
+            if d != 0:
+                bad.append("%s: '%s' 比 '%s' 多 %d 个" % (rel(root, p), op, cl, d))
+                break
+    if bad:
+        warn("语法自检: %d/%d 个文件括号不配平, 构建大概率会失败:" % (len(bad), n))
+        for b in bad[:10]:
+            warn("  " + b)
+        return False
+    log("语法自检: %d 个 Kotlin/Gradle 文件括号全部配平" % n)
+    return True
+
+
 def replace_fun_body(src, sig_pattern, new_body):
     """替换整个函数体(保留签名与外层大括号)。返回 (new_src, ok)"""
     span = fun_span(src, sig_pattern)
@@ -414,7 +444,17 @@ SHAMSI_FREE_DATE = '''
 
 
 def patch_dialog(root):
-    """日期格式弹窗精简为 1 项 (入口虽然隐藏了, 留着防止别处调起)"""
+    """日期格式弹窗: 去掉波斯历开关。
+
+    重要教训(实测踩过):
+      1) 这个文件只 import 了 beVisibleIf, 没有 beGone。插 beGone() 会
+         Unresolved reference。所以隐藏统一用已 import 的 beVisibleIf(false)。
+      2) 弹窗实际只有 8 个 Radio(One~Eight + Ten, 跳过 Nine), 但常量有 14 个。
+         按常量名去生成 RadioNine/RadioEleven... 会 Unresolved。
+         所以绝不按常量名猜布局里有哪些 id —— 需要时先扫布局文件。
+      3) 日期常量已经全仓统一, 弹窗里所有选项显示的是同一个格式,
+         选哪个结果都一样, 无需隐藏 Radio(隐藏反而有风险)。
+    """
     path = find_file(root, "commons/src/main/kotlin/com/goodwy/commons/dialogs",
                      "ChangeDateTimeFormatDialog.kt")
     if not path:
@@ -422,32 +462,20 @@ def patch_dialog(root):
         return
     src = read(path)
     orig = src
-    # 波斯历开关: 这个开关就藏在该弹窗里(showShamsi 控制显示), 一并废掉。
-    # Kotlin 里的 beVisibleIf(showShamsi) 会覆盖 XML 的 visibility, 所以必须改代码。
+
+    # 波斯历开关: 用已 import 的 beVisibleIf(false) 隐藏, 不引入 beGone
     src = re.sub(r'changeDateTimeDialogUseShamsiHolder\.beVisibleIf\([^)]*\)',
-                 'changeDateTimeDialogUseShamsiHolder.beGone()', src)
+                 'changeDateTimeDialogUseShamsiHolder.beVisibleIf(false)', src)
+    # 取值也恒为 false, 彻底不走波斯历
     src = re.sub(r'(val useShamsi\s*=\s*)[^\n]*',
-                 r'\1false  // 波斯历已移除', src)
+                 r'\1false', src)
     # Compose 版: 只留第一项
     src = re.sub(r'\n[ \t]*Pair\(DATE_FORMAT_(?!ONE\b)[A-Z0-9_]+,.*?\),(?=\n)', '', src)
-    # XML 版: 隐藏 RadioTwo..Fourteen
-    lines = src.split("\n")
-    out, inserted = [], 0
-    for line in lines:
-        out.append(line)
-        m = re.match(r'(\s*)changeDateTimeDialogRadioOne\.text\s*=', line)
-        if m and not inserted:
-            ind = m.group(1)
-            for n in ("Two", "Three", "Four", "Five", "Six", "Seven", "Eight",
-                      "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen"):
-                out.append('%schangeDateTimeDialogRadio%s.visibility = '
-                           'android.view.View.GONE' % (ind, n))
-            inserted = 1
-    src = "\n".join(out)
+
     if src != orig:
         write(path, src)
-    log("ChangeDateTimeFormatDialog.kt: 弹窗已精简为 1 项%s"
-        % ("" if inserted else " (Compose 版已处理)"))
+        log("ChangeDateTimeFormatDialog.kt: 波斯历开关已移除 "
+            "(日期常量已统一, 弹窗各选项显示同一格式)")
 
 
 def patch_app_force_format(root, fmt):
@@ -655,20 +683,10 @@ def patch_sideload_dialog(root):
         log("commons: AppSideLoadedAlertDialog (Compose 版) 已空壳化")
     write(p, src)
 
-    n = 0
-    for f in walk_files(root, (".kt",)):
-        try:
-            s = read(f)
-        except Exception:
-            continue
-        o = s
-        s = re.sub(r'([ \t]*)showSideloadingDialog\(\)',
-                   r'\1// showSideloadingDialog()  // 签名认证已移除', s)
-        if s != o:
-            write(f, s)
-            n += 1
-    if n:
-        log("commons: 已注释 %d 处 showSideloadingDialog 调用" % n)
+    # 注意: 不要去注释 showSideloadingDialog() 的"调用点"。
+    # Activity.kt 里有 `fun Activity.showSideloadingDialog() {` 这个定义,
+    # 朴素正则会连它一起注释掉 -> fun Activity.// xxx { -> 语法错误。
+    # 而且入口已经空壳化(直接 callback), 调用它本身是无害的, 不需要动。
 
 
 # ------------------------------------------------------------------ 3. 语言精简
@@ -1404,7 +1422,8 @@ def main():
         if not a.no_italic_fix:
             patch_italic(root)
 
-    log("完成")
+    ok = verify_syntax(root)
+    log("完成%s" % ("" if ok else " (但自检有问题, 见上面的 WARN)"))
 
 
 if __name__ == "__main__":
