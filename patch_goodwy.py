@@ -173,6 +173,63 @@ def replace_fun_body(src, sig_pattern, new_body):
     return src[:s + 1] + new_body + src[e:], True
 
 
+def drop_branch(src, cond):
+    """删掉一个 if/else-if 分支(含条件与函数体), 用于彻底移除语音输入这类
+    散布在多个方法里的条件分支。返回 (new_src, count)。
+
+    两种形态都处理:
+      if (COND) {                 -> 整块删掉(它是独立的 if, 没有 else 跟随)
+        A
+      }
+
+      } else if (COND) {          -> 只删 "else if (COND) { A }" 这一段,
+        A                            保留前后的 "} " 与 " else {", 变成
+      } else {                       } else { B }
+        B
+      }
+
+    用大括号配平定位, 不依赖固定行数 —— 分支内部嵌套再多 {} 也不会截错。
+    """
+    msk = _mask(src)
+    out, n = src, 0
+    while True:
+        msk = _mask(out)
+        # 优先匹配 else if 形态(它前面有 "} ")
+        m = re.search(r'(?m)^([ \t]*)\} else if \(' + cond + r'\) \{', msk)
+        is_else = bool(m)
+        if not m:
+            m = re.search(r'(?m)^([ \t]*)if \(' + cond + r'\) \{', msk)
+            if not m:
+                break
+        i = msk.rfind("{", m.start(), m.end())
+        if i < 0:
+            break
+        depth, j = 0, i
+        while j < len(msk):
+            if msk[j] == "{":
+                depth += 1
+            elif msk[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            break
+        if is_else:
+            # 从 "else" 起删到配对 '}' (含), 留下前面的 "} " 与后面的 " else {"
+            start = m.start() + m.group(0).index("else")
+            out = out[:start] + out[j + 1:]
+        else:
+            out = out[:m.start()] + out[j + 1:]
+        n += 1
+        if n > 8:      # 保险丝, 防止正则意外死循环
+            break
+    if n:
+        out = re.sub(r'\}[ \t]{2,}else', '} else', out)
+        out = re.sub(r'\n[ \t]*\n[ \t]*\n', '\n\n', out)
+    return out, n
+
+
 def drop_fun(src, sig_pattern):
     """整段删除一个顶层函数(含签名与函数体), 用于移除波斯历分支函数。
     返回 (new_src, ok)。"""
@@ -743,6 +800,109 @@ def patch_about_activity(root):
         log("commons: AboutActivity 已空壳化 (onCreate 直接 finish, 关于页所有选项彻底消失)")
     else:
         warn("commons: AboutActivity.onCreate 未匹配, 未空壳化")
+
+
+# ------------------------------------------------------ 11. 语音输入(彻底删)
+def patch_speech_commons(root):
+    """commons 侧删掉语音转文字的底层实现。
+
+    这两个是顶层扩展函数, 删掉后 app 侧所有调用点必须一并清理,
+    否则 ThreadActivity 会 Unresolved reference —— 所以 app 侧改动
+    (patch_speech_app) 必须配套执行。
+    """
+    p = find_file(root, "commons/src/main/kotlin/com/goodwy/commons/extensions",
+                  "Activity.kt")
+    if not p:
+        warn("找不到 commons Activity.kt, 跳过语音输入删除")
+        return
+    src = read(p)
+    n = 0
+    for sig in (r'fun Activity\.speechToText\(',
+                r'fun Activity\.isSpeechToTextAvailable\('):
+        src, ok = drop_fun(src, sig)
+        n += 1 if ok else 0
+    if n:
+        # 判断"还有没有别处在用"时, 必须先把 import 那行本身摘掉再检查 ——
+        # 否则 import 行自带的 "RecognizerIntent" 会让判断永远成立, import 永远删不掉。
+        body = re.sub(r'(?m)^import android\.speech\.RecognizerIntent\n', '', src)
+        if 'RecognizerIntent' not in body:
+            src = body
+        write(p, src)
+        log("commons: 已删除 %d/2 个语音输入函数 (speechToText / "
+            "isSpeechToTextAvailable)" % n)
+    else:
+        warn("commons: 语音输入函数一个都没删掉, 请检查签名")
+
+
+def patch_speech_app(root):
+    """app 侧彻底删掉语音输入: 设置开关 + 发送键变麦克风 + 长按 + 结果回填。
+
+    安全设计: 只有当所有条件分支都删干净了, 才去删变量声明和 import。
+    反过来(先删声明)一旦某个分支没匹配上, 就会留下 Unresolved reference,
+    编译期才炸 —— 这个顺序不能颠倒。
+    """
+    layout = os.path.join(root, "app", "src", "main", "res", "layout",
+                          "activity_settings.xml")
+    if os.path.exists(layout):
+        s = read(layout)
+        s, ok = set_view_gone(s, "settingsUseSpeechToTextHolder")
+        if ok:
+            write(layout, s)
+            log("activity_settings.xml: 「语音输入」设置项已隐藏")
+        else:
+            warn("activity_settings.xml 未找到 settingsUseSpeechToTextHolder")
+    else:
+        warn("找不到 activity_settings.xml")
+
+    # --- SettingsActivity: 删设置项函数与调用 ---
+    q = find_file(root, "app/src/main/kotlin/com/goodwy/smsmessenger/activities",
+                  "SettingsActivity.kt")
+    if q:
+        s = read(q)
+        s = re.sub(r'(?m)^[ \t]*setupUseSpeechToText\(\)\n', '', s)
+        s, ok = drop_fun(s, r'private fun setupUseSpeechToText\(')
+        write(q, s)
+        log("SettingsActivity.kt: 语音输入设置项已删除%s"
+            % ("" if ok else " (函数未匹配, 仅删了调用)"))
+    else:
+        warn("找不到 SettingsActivity.kt")
+
+    # --- ThreadActivity: 删分支 -> 再删声明/import ---
+    p = find_file(root, "app/src/main/kotlin/com/goodwy/smsmessenger/activities",
+                  "ThreadActivity.kt")
+    if not p:
+        warn("找不到 ThreadActivity.kt")
+        return
+    src = read(p)
+
+    src, c1 = drop_branch(src, 'isSpeechToTextAvailable')
+    src, c2 = drop_branch(src, r'requestCode == REQUEST_CODE_SPEECH_INPUT')
+    log("ThreadActivity.kt: 已删除 %d 个语音分支 + %d 个识别结果回填块"
+        % (c1, c2))
+
+    # 只有分支清干净了才动声明/import, 否则会留 Unresolved reference。
+    # 注意: 判断残留时必须先把"声明行/赋值行本身"摘掉再检查 ——
+    # 它们自身就含 isSpeechToTextAvailable, 不摘掉会永远判定为有残留,
+    # 结果变量声明永远删不掉(正是上一版踩的坑)。
+    P_DECL = r'(?m)^[ \t]*private var isSpeechToTextAvailable = false\n'
+    P_ASSIGN = (r'(?m)^[ \t]*isSpeechToTextAvailable = if '
+                r'\(config\.useSpeechToText\).*\n')
+    body = re.sub(P_DECL, '', src)
+    body = re.sub(P_ASSIGN, '', body)
+    left = [l.strip() for l in body.split("\n") if 'isSpeechToTextAvailable' in l]
+    if left:
+        warn("ThreadActivity.kt 仍残留 %d 处引用, 保留变量声明以免编译失败: %s"
+             % (len(left), left[:2]))
+    else:
+        src = body
+        log("ThreadActivity.kt: 已删除变量声明与赋值")
+
+    body = re.sub(r'(?m)^import android\.speech\.RecognizerIntent\n', '', src)
+    if 'RecognizerIntent' not in body:
+        src = body
+        log("ThreadActivity.kt: 已删除 RecognizerIntent import")
+
+    write(p, src)
 
 
 # -------------------------------------------------- 8b. 更新日志 (What's New)
@@ -1638,6 +1798,8 @@ def main():
                     help="不解锁付费功能 (默认打开项目支持的 UNLOCK 开关)")
     ap.add_argument("--keep-purchase-page", action="store_true",
                     help="保留 foss 的项目支持页 (默认空壳化: 入口已隐藏且无需购买)")
+    ap.add_argument("--keep-speech", action="store_true",
+                    help="保留语音输入功能 (默认彻底删除: 设置项 + 麦克风按钮 + 长按 + 结果回填)")
     a = ap.parse_args()
     a.hide_datefmt = not a.no_hide_datefmt
     a.abi_trim = not a.no_abi_trim
@@ -1658,6 +1820,8 @@ def main():
             patch_ispro_always_true(root)
             if not a.keep_purchase_page:
                 patch_purchase_page(root)
+        if not a.keep_speech:
+            patch_speech_commons(root)
         patch_constants(root, a.date_format)
         patch_baseconfig(root, a.date_format, not a.no_unlock_pro)
         patch_longkt(root, a.date_mode)
@@ -1685,6 +1849,8 @@ def main():
         if not a.no_dialog_trim:
             patch_app_dialogs(root)
             patch_other_group(root)
+        if not a.keep_speech:
+            patch_speech_app(root)
         if a.package_name:
             patch_package(root, a.package_name)
         patch_app_version(root, a.commons_version)
