@@ -1,0 +1,238 @@
+name: Build Custom Right Messages
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_format:
+        description: '日期格式  M-d-yyyy=9-11-2026(月在前) / d-M-yyyy=11-9-2026(日在前) / yyyy-MM-dd=2026-09-11'
+        required: true
+        default: 'M-d-yyyy'
+      date_mode:
+        description: 'full=所有短信统一显示日期(今天也显示日期) / keep-year=今天仍显示时间,但不再隐藏年份'
+        type: choice
+        options: [full, keep-year]
+        default: full
+      flavor:
+        description: '构建渠道: foss=无 Google 内购(推荐) / gplay / rustore。只构建单渠道可避免 Room schema 并发写坏'
+        type: choice
+        options: [foss, gplay, rustore]
+        default: foss
+      package_name:
+        description: '改包名 (如 com.mycompany.sms)。留空=保持 com.goodwy.smsmessenger。改后与官方版可共存安装'
+        required: false
+        default: ''
+      commons_ref:
+        description: 'commons 分支/commit (留空=main。若某次构建报接口不匹配, 可填一个能配得上当前 app 的 commit)'
+        required: false
+        default: 'main'
+      locales:
+        description: '语言白名单(逗号分隔, 默认 zh-rCN)。例如 zh-rCN,en'
+        required: false
+        default: ''
+      trim_langs:
+        description: '语言精简: 只保留简体中文(中国), 删除其余所有语种(含繁体)'
+        type: boolean
+        default: true
+      locale_filters:
+        description: '用 localeFilters 剔掉 AAR(androidx) 带来的重复语言项, 让系统"应用语言"列表只剩中文(中国)'
+        type: boolean
+        default: true
+      strip_about:
+        description: '去掉主界面/设置页的「关于」入口, 并把关于页(FAQ/邮箱/GitHub/捐赠/隐私政策/许可)整个空壳化'
+        type: boolean
+        default: true
+      hide_datefmt:
+        description: '隐藏设置页「更改日期和时间格式」入口 (日期已全仓统一, 留着只会让人改回去)'
+        type: boolean
+        default: true
+      abi_trim:
+        description: '只打 64 位 ARM (arm64-v8a), 剔除其它架构的 .so'
+        type: boolean
+        default: true
+      device_trim:
+        description: '只保留手机资源, 删除平板/电视/车机专用目录与低密度位图'
+        type: boolean
+        default: true
+      italic_fix:
+        description: '应用内所有斜体 (textStyle=italic / Typeface.ITALIC) 改成默认正体'
+        type: boolean
+        default: true
+      purchase_trim:
+        description: '删除设置页「购买 Thank You」卡片与「小费罐 / Tip Jar」'
+        type: boolean
+        default: true
+      google_trim:
+        description: '移除 play-services-location 依赖, 打开 hide_google_relations 开关'
+        type: boolean
+        default: true
+      sideload_trim:
+        description: '去掉签名认证弹窗 (否则自编译版会弹「应用已损坏, 请从商店重新下载」)'
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Messages
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Preflight (检查脚本是否随仓库提交)
+        run: |
+          set -e
+          if [ ! -f "$GITHUB_WORKSPACE/patch_goodwy.py" ]; then
+            echo "::error::仓库根目录缺少 patch_goodwy.py, 请把它一起提交上来"
+            exit 1
+          fi
+          python3 -c "import sys; print('python', sys.version.split()[0])"
+
+      - name: Clone Goodwy-Commons
+        run: |
+          set -e
+          rm -rf "$RUNNER_TEMP/commons"
+          REF="${{ inputs.commons_ref }}"
+          [ -z "$REF" ] && REF=main
+          git clone --depth 1 --branch "$REF" https://github.com/Goodwy/Goodwy-Commons.git "$RUNNER_TEMP/commons" \
+            || git clone --depth 1 https://github.com/Goodwy/Goodwy-Commons.git "$RUNNER_TEMP/commons"
+          echo "commons HEAD: $(git -C "$RUNNER_TEMP/commons" rev-parse --short HEAD)"
+
+      - name: Patch commons (日期统一 + 关于页空壳 + 语言精简 + 斜体)
+        run: |
+          set -e
+          FLAGS=""
+          if [ "${{ inputs.trim_langs }}" != "true" ]; then FLAGS="$FLAGS --no-trim-langs"; fi
+          if [ "${{ inputs.strip_about }}" != "true" ]; then FLAGS="$FLAGS --no-strip-about"; fi
+          if [ "${{ inputs.italic_fix }}" != "true" ]; then FLAGS="$FLAGS --no-italic-fix"; fi
+          LOCALES=""
+          if [ -n "${{ inputs.locales }}" ]; then
+            IFS=',' read -ra LS <<< "${{ inputs.locales }}"
+            for L in "${LS[@]}"; do
+              L_TRIM=$(echo "$L" | xargs)
+              [ -n "$L_TRIM" ] && LOCALES="$LOCALES --locale $L_TRIM"
+            done
+          fi
+          python3 patch_goodwy.py commons "$RUNNER_TEMP/commons" \
+            --date-format "${{ inputs.date_format }}" \
+            --date-mode "${{ inputs.date_mode }}" \
+            --commons-version 99.0.0-custom $FLAGS $LOCALES
+
+      - name: Publish commons to mavenLocal
+        run: |
+          set -e
+          cd "$RUNNER_TEMP/commons"
+          FLAVOR="${{ inputs.flavor }}"
+          CAP="$(echo "${FLAVOR:0:1}" | tr 'a-z' 'A-Z')${FLAVOR:1}"
+          chmod +x gradlew
+          # strings 模块也要发, 否则 commons 的 POM 里会引用一个找不到的 strings 构件
+          ./gradlew :strings:publishToMavenLocal \
+                    ":commons:publish${CAP}ReleasePublicationToMavenLocal" \
+                    -PVERSION=99.0.0-custom --no-daemon --stacktrace
+          echo "--- mavenLocal 里的产物 ---"
+          find ~/.m2/repository/com/github/goodwy -name "*.aar" -o -name "*.pom" | sort
+
+      - name: Patch app (关于入口 + 语言 + 斜体 + 版本指向)
+        run: |
+          set -e
+          FLAGS=""
+          if [ "${{ inputs.trim_langs }}" != "true" ]; then FLAGS="$FLAGS --no-trim-langs"; fi
+          if [ "${{ inputs.locale_filters }}" != "true" ]; then FLAGS="$FLAGS --no-locale-filters"; fi
+          if [ "${{ inputs.strip_about }}" != "true" ]; then FLAGS="$FLAGS --no-strip-about"; fi
+          if [ "${{ inputs.hide_datefmt }}" != "true" ]; then FLAGS="$FLAGS --no-hide-datefmt"; fi
+          if [ "${{ inputs.abi_trim }}" != "true" ]; then FLAGS="$FLAGS --no-abi-trim"; fi
+          if [ "${{ inputs.device_trim }}" != "true" ]; then FLAGS="$FLAGS --no-device-trim"; fi
+          if [ "${{ inputs.purchase_trim }}" != "true" ]; then FLAGS="$FLAGS --no-purchase-trim"; fi
+          if [ "${{ inputs.google_trim }}" != "true" ]; then FLAGS="$FLAGS --no-google-trim"; fi
+          if [ "${{ inputs.italic_fix }}" != "true" ]; then FLAGS="$FLAGS --no-italic-fix"; fi
+          PKGARG=""
+          if [ -n "${{ inputs.package_name }}" ]; then
+            PKGARG="--package-name ${{ inputs.package_name }}"
+          fi
+          LOCALES=""
+          if [ -n "${{ inputs.locales }}" ]; then
+            IFS=',' read -ra LS <<< "${{ inputs.locales }}"
+            for L in "${LS[@]}"; do
+              L_TRIM=$(echo "$L" | xargs)
+              [ -n "$L_TRIM" ] && LOCALES="$LOCALES --locale $L_TRIM"
+            done
+          fi
+          python3 patch_goodwy.py app "$GITHUB_WORKSPACE" \
+            --date-format "${{ inputs.date_format }}" \
+            --date-mode "${{ inputs.date_mode }}" \
+            --commons-version 99.0.0-custom $FLAGS $LOCALES $PKGARG
+
+      - name: Patch 自检 (源码层面确认改动落盘了)
+        run: |
+          echo "=== 日期格式常量 ==="
+          grep -h "const val DATE_FORMAT_" "$RUNNER_TEMP/commons/commons/src/main/kotlin/com/goodwy/commons/helpers/Constants.kt" | head -4
+          echo "=== 主菜单 about ==="
+          grep -A2 '@+id/about' app/src/main/res/menu/menu_main.xml || echo "(about 已不存在)"
+          echo "=== 剩余语言目录 ==="
+          ls app/src/main/res | grep '^values' | tr '\n' ' '; echo
+          echo "=== 残留斜体 ==="
+          grep -rn 'textStyle="italic"\|Typeface.ITALIC\|>italic<' app/src --include=*.xml --include=*.kt | head -10 || echo "(无残留)"
+          echo "=== ABI 过滤 ==="
+          grep -A2 "abiFilters" app/build.gradle.kts || echo "(未生效)"
+          echo "=== 非手机资源目录(应为空) ==="
+          ls app/src/main/res | grep -E 'sw600dp|television|xlarge' || echo "(已清空)"
+          echo "=== 波斯历残留(commons, 应为空) ==="
+          grep -rn 'PersianDate\|Shamsi(' "$RUNNER_TEMP/commons/commons/src/main/kotlin/com/goodwy/commons/extensions/Long.kt" || echo "(已清除)"
+          echo "=== 包名 ==="
+          grep '^APP_ID' gradle.properties
+          echo "=== 购买卡片(应全为 beGone, 且无 .beGone()) 语法错误) ==="
+          grep -n 'PurchaseThankYouHolder.beGone\|TipJarHolder.beGone' app/src/main/kotlin/*/activities/SettingsActivity.kt 2>/dev/null | head -5 || echo "(未找到, 用 find 再试)"
+          echo "=== 购买卡片(应已 gone) ==="
+          grep -A1 'settingsPurchaseThankYouHolder"' app/src/main/res/layout/activity_settings.xml | head -2
+          echo "=== 日期格式常量(应全部相同) ==="
+          grep -h 'const val DATE_FORMAT_' "$RUNNER_TEMP/commons/commons/src/main/kotlin/com/goodwy/commons/helpers/Constants.kt" | sort -u
+
+      - name: Build release APK
+        run: |
+          set -e
+          FLAVOR="${{ inputs.flavor }}"
+          CAP="$(echo "${FLAVOR:0:1}" | tr 'a-z' 'A-Z')${FLAVOR:1}"
+          TASK="assemble${CAP}Release"
+          echo "构建任务: $TASK"
+          chmod +x gradlew
+          # 三个渠道的 KSP 会并发写同一个 app/schemas/*.json, 互相读半截内容会报
+          # "Expected end of the object ...". 只构建单渠道 + 清掉历史残留即可避开。
+          rm -rf app/schemas
+          ./gradlew "$TASK" --no-daemon --no-parallel --stacktrace
+          echo "=== 构建产物 ==="
+          find app/build/outputs/apk -name "*.apk" -print
+
+      - name: Sign APK
+        run: |
+          set -e
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
+          echo "build-tools: $BT"
+          APK=$(find app/build/outputs/apk -name "*.apk" | grep -i release | grep -vi unsigned | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find app/build/outputs/apk -name "*unsigned.apk" | head -1)
+          fi
+          if [ -z "$APK" ]; then echo "::error::没找到 release APK"; exit 1; fi
+          echo "source apk: $APK"
+          keytool -genkeypair -v -keystore custom.jks -keyalg RSA -keysize 2048 \
+            -validity 10950 -alias custom -storepass android -keypass android \
+            -dname "CN=Custom, OU=Custom, O=Custom, L=X, ST=X, C=CN"
+          "${BT}zipalign" -p -f 4 "$APK" aligned.apk
+          "${BT}apksigner" sign --ks custom.jks --ks-key-alias custom \
+            --ks-pass pass:android --key-pass pass:android \
+            --out RightMessages-custom.apk aligned.apk
+          "${BT}apksigner" verify RightMessages-custom.apk || true
+          ls -lh RightMessages-custom.apk
+          echo "=== APK 实际支持的语言 ==="
+          "${BT}aapt2" dump badging RightMessages-custom.apk | grep -i "^locales" || echo "(未取到, 忽略)"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RightMessages-custom
+          path: RightMessages-custom.apk
