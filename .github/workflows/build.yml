@@ -74,9 +74,13 @@ on:
         type: boolean
         default: true
       unlock_pro:
-        description: '项目支持页的 UNLOCK 开关默认打开 (解锁自定义颜色等全部付费功能)'
+        description: '解锁全部付费功能 (isPro 恒 true: 去掉「已锁定」标签/变灰, 解锁自定义颜色等)'
         type: boolean
         default: true
+      keep_purchase_page:
+        description: '保留 foss 的项目支持页 (默认勾 false = 空壳化, 因为入口已隐藏且无需购买)'
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -147,6 +151,7 @@ jobs:
           if [ "${{ inputs.google_trim }}" != "true" ]; then FLAGS="$FLAGS --no-google-trim"; fi
           if [ "${{ inputs.dialog_trim }}" != "true" ]; then FLAGS="$FLAGS --no-dialog-trim"; fi
           if [ "${{ inputs.unlock_pro }}" != "true" ]; then FLAGS="$FLAGS --no-unlock-pro"; fi
+          if [ "${{ inputs.keep_purchase_page }}" = "true" ]; then FLAGS="$FLAGS --keep-purchase-page"; fi
           if [ "${{ inputs.italic_fix }}" != "true" ]; then FLAGS="$FLAGS --no-italic-fix"; fi
           LOCALES=""
           if [ -n "${{ inputs.locales }}" ]; then
