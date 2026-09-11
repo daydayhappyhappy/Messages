@@ -22,9 +22,9 @@ on:
         required: false
         default: ''
       commons_ref:
-        description: 'commons 分支/commit (留空=main。若某次构建报接口不匹配, 可填一个能配得上当前 app 的 commit)'
+        description: 'commons 分支/commit。留空=自动用 app 锁定的那个 commit(推荐)。一般情况下不需要改'
         required: false
-        default: 'main'
+        default: ''
       locales:
         description: '语言白名单(逗号分隔, 默认 zh-rCN)。例如 zh-rCN,en'
         required: false
@@ -97,12 +97,37 @@ jobs:
       - name: Clone Goodwy-Commons
         run: |
           set -e
-          rm -rf "$RUNNER_TEMP/commons"
+          # 关键: 必须 checkout app 实际锁定的那个 commons commit, 不能用 main。
+          # commons main 已升到 AGP 9.3.1 / compileSdk 37 / lifecycle 2.11.0,
+          # 而 app 还是 AGP 9.0.1 / compileSdk 36 —— 用 main 编出的 AAR 带
+          # "requires compile against version 37" 元数据, app 侧 CheckAarMetadata 必挂。
+          APP_TOML="$GITHUB_WORKSPACE/gradle/libs.versions.toml"
+          PINNED=$(grep -oP '(?<=right-commons = ")[^"]+' "$APP_TOML" 2>/dev/null | head -1)
+          APP_SDK=$(grep -oP '(?<=app-build-compileSDKVersion = ")[^"]+' "$APP_TOML" 2>/dev/null | head -1)
           REF="${{ inputs.commons_ref }}"
+          [ -z "$REF" ] && REF="$PINNED"
           [ -z "$REF" ] && REF=main
-          git clone --depth 1 --branch "$REF" https://github.com/Goodwy/Goodwy-Commons.git "$RUNNER_TEMP/commons" \
-            || git clone --depth 1 https://github.com/Goodwy/Goodwy-Commons.git "$RUNNER_TEMP/commons"
-          echo "commons HEAD: $(git -C "$RUNNER_TEMP/commons" rev-parse --short HEAD)"
+          echo "app 锁定的 commons commit : ${PINNED:-未读到}"
+          echo "app      compileSdk       : ${APP_SDK:-未读到}"
+          echo "实际使用的 commons ref    : $REF"
+          echo "APP_SDK=$APP_SDK" >> "$GITHUB_ENV"
+
+          rm -rf "$RUNNER_TEMP/commons"
+          mkdir -p "$RUNNER_TEMP/commons"
+          cd "$RUNNER_TEMP/commons"
+          git init -q
+          git remote add origin https://github.com/Goodwy/Goodwy-Commons.git
+          # 先试按 SHA 浅拉(快); 不支持则整仓 clone 再 checkout
+          if ! git fetch -q --depth 1 origin "$REF"; then
+            echo "按 SHA 浅拉失败, 改为整仓 clone"
+            cd "$RUNNER_TEMP" && rm -rf commons && git clone -q https://github.com/Goodwy/Goodwy-Commons.git commons
+            cd "$RUNNER_TEMP/commons"
+            git checkout -q "$REF" || git checkout -q main
+          else
+            git checkout -q FETCH_HEAD
+          fi
+          echo "commons HEAD        : $(git rev-parse --short HEAD)"
+          echo "commons compileSdk  : $(grep -oP '(?<=app-build-compileSDKVersion = ")[^"]+' gradle/libs.versions.toml)"
 
       - name: Patch commons (日期统一 + 关于页空壳 + 语言精简 + 斜体)
         run: |
@@ -122,7 +147,7 @@ jobs:
           python3 patch_goodwy.py commons "$RUNNER_TEMP/commons" \
             --date-format "${{ inputs.date_format }}" \
             --date-mode "${{ inputs.date_mode }}" \
-            --commons-version 99.0.0-custom $FLAGS $LOCALES
+            --commons-version 99.0.0-custom --compile-sdk "$APP_SDK" $FLAGS $LOCALES
 
       - name: Publish commons to mavenLocal
         run: |
