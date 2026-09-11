@@ -229,6 +229,44 @@ def drop_fun(src, sig_pattern):
 
 
 # ------------------------------------------------------------------ 1. 时间统一
+def patch_sdk_align(root, sdk):
+    """把 commons 的 compileSdk/targetSdk 对齐到 app 的值。
+
+    背景(实测踩过): commons main 已经升到 AGP 9.3.1 / compileSdk 37 /
+    lifecycle 2.11.0, 而 app 还在 AGP 9.0.1 / compileSdk 36。拿 main 编出来的
+    AAR 会带 "requires compile against version 37" 的元数据, app 一解析就
+    CheckAarMetadata 失败。
+
+    优先解法是 clone 时严格 checkout app 锁定的那个 commons commit;
+    这里是兜底 —— 万一有人手动把 commons_ref 改成 main 也能编过。
+    注意: lifecycle 2.11.0 硬性要求 compileSdk >= 37, 所以降级 SDK 时必须
+    同时把 lifecycle 压回 2.10.0, 否则报的是同一个错。
+    """
+    if not sdk:
+        return
+    p = os.path.join(root, "gradle", "libs.versions.toml")
+    if not os.path.exists(p):
+        warn("commons 侧找不到 gradle/libs.versions.toml, 跳过 SDK 对齐")
+        return
+    s = read(p)
+    orig = s
+
+    s, k1 = re.subn(r'(?m)^(app-build-compileSDKVersion\s*=\s*)"[^"]*"',
+                    r'\1"%s"' % sdk, s)
+    s, k2 = re.subn(r'(?m)^(app-build-targetSDK\s*=\s*)"[^"]*"',
+                    r'\1"%s"' % sdk, s)
+
+    if int(sdk) < 37:
+        s, k3 = re.subn(r'(?m)^(androidx-lifecycle\s*=\s*)"[^"]*"',
+                        r'\1"2.10.0"', s)
+        if k3:
+            log("commons: androidx-lifecycle 压回 2.10.0 (2.11.0 要求 compileSdk>=37)")
+
+    if s != orig:
+        write(p, s)
+        log("commons: compileSdk/targetSdk 已对齐为 %s" % sdk)
+
+
 def patch_constants(root, fmt):
     """把所有 DATE_FORMAT_XXX 常量统一成一个格式。
     Goodwy 的 commons 有 14 个常量(ONE..FOURTEEN), 不是 Fossify 的 8 个。"""
@@ -1338,6 +1376,9 @@ def main():
     ap.add_argument("--date-format", default="M-d-yyyy")
     ap.add_argument("--date-mode", choices=["full", "keep-year"], default="full")
     ap.add_argument("--commons-version", default="99.0.0-custom")
+    ap.add_argument("--compile-sdk", default=None,
+                    help="把 commons 的 compileSdk/targetSdk 对齐到这个值 "
+                         "(应填 app 的 app-build-compileSDKVersion)")
     ap.add_argument("--locale", action="append", default=None,
                     help="语言白名单, 可重复, 默认 zh-rCN")
     ap.add_argument("--no-trim-langs", action="store_true")
@@ -1377,6 +1418,8 @@ def main():
     if a.target == "commons":
         log("=== patch commons (%s) ===" % os.path.basename(root.rstrip("/")))
         patch_commons_version(root, a.commons_version)
+        if a.compile_sdk:
+            patch_sdk_align(root, a.compile_sdk)
         patch_constants(root, a.date_format)
         patch_baseconfig(root, a.date_format)
         patch_longkt(root, a.date_mode)
