@@ -79,49 +79,27 @@ MODIFIERS = (r"(?:(?:private|internal|override|public|protected|open|suspend|"
 def _mask(src):
     """把注释和字符串内容替换成等长空格, 只留代码骨架。
     定位函数体时必须用它 —— Long.kt 里就有一段被注释掉的旧实现,
-    签名和真的一模一样, 直接 re.search 会命中注释, 后面的大括号配平全乱。"""
-    out = list(src)
-    n = len(src)
-    i = 0
-    while i < n:
-        if src.startswith("/*", i):
-            j = src.find("*/", i + 2)
-            j = n if j < 0 else j + 2
-            for k in range(i, j):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = j
-        elif src.startswith("//", i):
-            j = src.find("\n", i)
-            j = n if j < 0 else j
-            for k in range(i, j):
-                out[k] = " "
-            i = j
-        elif src.startswith('"""', i):
-            j = src.find('"""', i + 3)
-            j = n if j < 0 else j + 3
-            for k in range(i, j):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = j
-        elif src[i] == '"':
-            i += 1
-            while i < n:
-                if src[i] == "\\":
-                    i += 2
-                    continue
-                if src[i] == '"':
-                    i += 1
-                    break
-                if src[i] == "\n":
-                    break
-                for k in range(i, i + 1):
-                    if out[k] != "\n":
-                        out[k] = " "
-                i += 1
-        else:
-            i += 1
-    return "".join(out)
+    签名和真的一模一样, 直接 re.search 会命中注释, 后面的大括号配平全乱。
+
+    用正则实现而非逐字符循环: commons 有几百个 kt 文件、数 MB 源码,
+    Python 逐字符跑一遍要几十秒, CI 里会被拖成超时。
+    """
+    def blank(m):
+        return re.sub(r'[^\n]', ' ', m.group(0))
+
+    pat = re.compile(
+        r'/\*.*?\*/'                  # /* ... */
+        r'|//[^\n]*'                   # // ...
+        r'|"""(?:\\.|[^\\])*?"""'        # """ ... """
+        r'|"(?:\\.|[^"\\\n])*"'          # " ... "
+        r"|'(?:\\.|[^'\\\n])*'",         # ' ... '
+        re.S)
+    return pat.sub(blank, src)
+
+
+MODIFIERS = (r"(?:(?:private|internal|override|public|protected|open|suspend|"
+            r"inline|operator|abstract|final|actual|expect|tailrec|external|"
+            r"infix|internal)\s+)*")
 
 
 def fun_span(src, sig_pattern):
@@ -286,7 +264,7 @@ def patch_constants(root, fmt):
     return k
 
 
-def patch_baseconfig(root, fmt):
+def patch_baseconfig(root, fmt, a_unlock_pro=True):
     """dateFormat 强制返回固定格式, 不再读 SharedPreferences / 系统 Locale"""
     path = find_file(root, "commons/src/main/kotlin/com/goodwy/commons/helpers",
                      "BaseConfig.kt")
@@ -311,9 +289,23 @@ def patch_baseconfig(root, fmt):
     src, k3 = re.subn(r'(var useShamsi: Boolean[^\n]*\n\s*get\(\)\s*=\s*)[^\n]*',
                       r'\1false', src)
 
-    # 4) 签名/侧载认证: appSideloadingStatus 恒为 FALSE。
+    # 4) 解锁全部付费功能 (项目支持页的 UNLOCK 开关默认打开)。
+    #    foss 渠道的 Context.isPro() 直接取 baseConfig.isProNoGP,
+    #    写死 true 后一举三得:
+    #      - PurchaseActivity 的 pro_switch 默认勾选
+    #      - 自定义颜色等付费功能全部解锁
+    #      - 设置页购买卡片 beGoneIf(isPro()) 自动隐藏
+    #    setter 保留(还是往 prefs 写), 不影响任何赋值点。
+    if a_unlock_pro:
+        src, k4 = re.subn(
+            r'(var isProNoGP: Boolean\s*\n\s*get\(\)\s*=\s*)[^\n]*',
+            r'\1true', src)
+    else:
+        k4 = 0
+
+    # 5) 签名/侧载认证: appSideloadingStatus 恒为 FALSE。
     #    这是"应用已损坏, 请从商店重新下载"弹窗的源头开关。
-    src, k4 = re.subn(
+    src, k5 = re.subn(
         r'(var appSideloadingStatus: Int\s*\n\s*get\(\)\s*=\s*)[^\n]*',
         r'\1SIDELOADING_FALSE', src)
 
@@ -330,6 +322,10 @@ def patch_baseconfig(root, fmt):
     else:
         warn("BaseConfig.kt: 未匹配到 useShamsi, 波斯历可能仍可开启")
     if k4:
+        log("BaseConfig.kt: isProNoGP 恒为 true (项目支持 UNLOCK 默认打开, 付费功能全解锁)")
+    else:
+        warn("BaseConfig.kt: 未匹配到 isProNoGP, 项目支持开关可能仍是关闭")
+    if k5:
         log("BaseConfig.kt: appSideloadingStatus 恒为 SIDELOADING_FALSE (签名认证弹窗关闭)")
     else:
         warn("BaseConfig.kt: 未匹配到 appSideloadingStatus")
@@ -681,6 +677,45 @@ def patch_about_activity(root):
         warn("commons: AboutActivity.onCreate 未匹配, 未空壳化")
 
 
+# -------------------------------------------------- 8b. 更新日志 (What's New)
+def patch_whatsnew_commons(root):
+    """commons 侧废掉更新日志。
+
+    app 侧有三个入口(启动自动弹 / 设置页右上角菜单 / checkWhatsNew),
+    这里从源头掐断, 即使 app 侧有漏网的调用也只是空转。
+    """
+    # 1) checkWhatsNew() 置空
+    p = find_file(root, "commons/src/main/kotlin/com/goodwy/commons/extensions",
+                  "Activity.kt")
+    if p:
+        src = read(p)
+        new, ok = replace_fun_body(src, r'fun BaseSimpleActivity\.checkWhatsNew\(',
+                                   '\n        return\n    ')
+        if ok:
+            write(p, new)
+            log("commons: checkWhatsNew() 已置空 (更新日志不再自动弹出)")
+        else:
+            warn("commons: 未定位到 checkWhatsNew()")
+    else:
+        warn("找不到 commons Activity.kt, 跳过 checkWhatsNew 置空")
+
+    # 2) WhatsNewDialog 空壳化
+    p = find_file(root, "commons/src/main/kotlin/com/goodwy/commons/dialogs",
+                  "WhatsNewDialog.kt")
+    if not p:
+        warn("找不到 WhatsNewDialog.kt, 跳过")
+        return
+    src = read(p)
+    if "更新日志已移除" in src:
+        log("commons: WhatsNewDialog 已处理过, 跳过")
+        return
+    new, ok = replace_fun_body(src, r'init\s*\{',
+                               '\n        // 更新日志已移除: 不弹窗\n    ')
+    if ok:
+        write(p, new)
+        log("commons: WhatsNewDialog 已空壳化")
+
+
 # ------------------------------------------------------- 8. 签名认证弹窗
 def patch_sideload_dialog(root):
     """干掉"应用已损坏/请从商店重新下载"的签名认证弹窗 (AppSideloadedDialog)。
@@ -905,6 +940,131 @@ def patch_settings_datefmt(root):
             "settingsChangeDateTimeFormatHolder.beGone()")
     else:
         warn("SettingsActivity.kt 未匹配到 setupChangeDateTimeFormat(), 仅依赖布局隐藏")
+
+
+# ------------------------------------------- 10b. 三类弹窗清理 (app 侧)
+def patch_app_dialogs(root):
+    """去掉三类启动/设置弹窗 + 设置页右上角的更新日志入口。
+
+    三个弹窗的触发点全在 MainActivity:
+      - 更新日志(图: 版本号卡片列表): onCreate 里的 checkWhatsNewDialog()
+      - 新应用推荐("重要消息和全新开始"): onResume 里的 newAppRecommendation()
+      - 数据访问披露: loadMessages() 里的 ConfirmationAdvancedDialog(warning_disclosure)
+
+    披露弹窗这里有个坑, 必须小心:
+      loadMessages() 是 if(!wasReminderWarningShown){ 弹窗+权限流程 }
+                      else { 同样的权限流程 }
+      而 wasReminderWarningShown 又同时控制着另外两个弹窗的开关。
+      所以: 把条件改成 false(走 else 分支, 不弹窗但权限流程照常),
+            再在函数开头把这个标志置 true, 保证后续逻辑一致。
+    """
+    p = find_file(root, "app/src/main/kotlin/com/goodwy/smsmessenger/activities",
+                  "MainActivity.kt")
+    if not p:
+        warn("找不到 MainActivity.kt, 三类弹窗清理跳过")
+        return
+    src = read(p)
+    orig = src
+
+    # 1) 启动时的更新日志
+    src, k1 = re.subn(
+        r'([ \t]*)if \(config\.wasReminderWarningShown\) checkWhatsNewDialog\(\)',
+        r'\1// if (config.wasReminderWarningShown) checkWhatsNewDialog()  '
+        r'// 更新日志已移除', src)
+
+    # 2) 新应用推荐弹窗 (只在 foss 渠道显示, 正是默认构建渠道)
+    src, k2 = re.subn(r'([ \t]*)newAppRecommendation\(\)',
+                      r'\1// newAppRecommendation()  // 新应用推荐弹窗已移除', src)
+
+    # 3) 数据访问披露: 条件恒假 -> 走 else 分支, 权限流程不受影响
+    src, k3 = re.subn(
+        r'if \(!config\.wasReminderWarningShown\) \{',
+        'if (false) {  // 数据访问披露弹窗已移除', src)
+
+    # 4) 标志置 true, 保持后续逻辑一致 (askPermissions 等依赖它)
+    if k3:
+        span = fun_span(src, r'private fun loadMessages\(')
+        if span:
+            ins = ('\n        config.wasReminderWarningShown = true  '
+                   '// 披露弹窗已移除, 直接视为已确认')
+            src = src[:span[0] + 1] + ins + src[span[0] + 1:]
+        else:
+            warn("MainActivity.kt 未定位到 loadMessages(), 标志未设置")
+
+    if src != orig:
+        write(p, src)
+    for k, msg in ((k1, "更新日志(启动时)"), (k2, "新应用推荐"),
+                   (k3, "数据访问披露")):
+        log("MainActivity.kt: %s %s" % (msg, "已移除" if k else "未匹配"))
+
+    # 5) 函数体兜底置空 (万一别处调用)
+    q = find_file(root, "app/src/main/kotlin/com/goodwy/smsmessenger/extensions",
+                  "Activity.kt")
+    if q:
+        s2 = read(q)
+        new2, ok2 = replace_fun_body(s2, r'fun Activity\.newAppRecommendation\(\)',
+                                     '\n        return\n    ')
+        if ok2:
+            write(q, new2)
+            log("extensions/Activity.kt: newAppRecommendation() 已置空")
+
+    # 6) 设置页右上角工具栏的「更新日志」入口
+    q = find_file(root, "app/src/main/kotlin/com/goodwy/smsmessenger/activities",
+                  "SettingsActivity.kt")
+    if q:
+        s3 = read(q)
+        new3, k4 = re.subn(r'[ \t]*R\.id\.whats_new\s*->\s*\{.*?\n[ \t]*\}\n',
+                           '', s3, flags=re.S)
+        if k4:
+            write(q, new3)
+            log("SettingsActivity.kt: 已删除工具栏「更新日志」菜单分支")
+        else:
+            warn("SettingsActivity.kt 未匹配到 whats_new 分支")
+    else:
+        warn("找不到 SettingsActivity.kt, 跳过菜单分支清理")
+
+    # 7) 菜单项本身: 保留 id(防止 R 符号丢失), 改为不可见
+    mp = os.path.join(root, "app", "src", "main", "res", "menu",
+                      "menu_settings.xml")
+    if os.path.exists(mp):
+        s = read(mp)
+        new = re.sub(r'(<item\b(?:(?!>).)*?@\+id/whats_new(?:(?!>).)*?)(/?)>',
+                     lambda m: (m.group(1) if 'android:visible' in m.group(1)
+                                else m.group(1).rstrip() + ' android:visible="false"')
+                     + m.group(2) + '>',
+                     s, flags=re.S)
+        if new != s:
+            write(mp, new)
+            log("menu_settings.xml: 工具栏「更新日志」已设为不可见")
+        else:
+            warn("menu_settings.xml 未匹配到 whats_new 项")
+    else:
+        warn("找不到 menu_settings.xml")
+
+
+def patch_other_group(root):
+    """隐藏设置页的「其他」分组标题。
+
+    这个分组里原本只有两项: 小费罐(已 gone) 和 关于(已 gone)。
+    两项都隐藏后, 空分组标题 + 空卡片会留着一个突兀的「其他」字样,
+    所以把标题和容器一起收掉。
+    """
+    layout = os.path.join(root, "app", "src", "main", "res", "layout",
+                          "activity_settings.xml")
+    if not os.path.exists(layout):
+        warn("找不到 activity_settings.xml, 跳过「其他」分组清理")
+        return
+    s = read(layout)
+    hit = []
+    for vid in ("settingsOtherLabel", "settingsOtherHolder"):
+        s, ok = set_view_gone(s, vid)
+        if ok:
+            hit.append(vid)
+    if hit:
+        write(layout, s)
+        log("activity_settings.xml: 「其他」分组已隐藏 (%s)" % ", ".join(hit))
+    else:
+        warn("activity_settings.xml 未找到「其他」分组 id")
 
 
 # ------------------------------------------------- 9. 购买 Thank You / 内购
@@ -1404,6 +1564,10 @@ def main():
                          "hide_google_relations)")
     ap.add_argument("--no-sideload-trim", action="store_true",
                     help="保留签名认证弹窗 (默认去掉「应用已损坏」弹窗)")
+    ap.add_argument("--no-dialog-trim", action="store_true",
+                    help="保留更新日志 / 新应用推荐 / 数据访问披露三类弹窗 (默认全部去掉)")
+    ap.add_argument("--no-unlock-pro", action="store_true",
+                    help="不解锁付费功能 (默认打开项目支持的 UNLOCK 开关)")
     a = ap.parse_args()
     a.hide_datefmt = not a.no_hide_datefmt
     a.abi_trim = not a.no_abi_trim
@@ -1421,7 +1585,7 @@ def main():
         if a.compile_sdk:
             patch_sdk_align(root, a.compile_sdk)
         patch_constants(root, a.date_format)
-        patch_baseconfig(root, a.date_format)
+        patch_baseconfig(root, a.date_format, not a.no_unlock_pro)
         patch_longkt(root, a.date_mode)
         patch_dialog(root)
         if not a.no_strip_about:
@@ -1431,6 +1595,8 @@ def main():
             patch_res_languages(root)
         if not a.no_sideload_trim:
             patch_sideload_dialog(root)
+        if not a.no_dialog_trim:
+            patch_whatsnew_commons(root)
         if not a.no_google_trim:
             patch_google_trim(root)
         if not a.no_italic_fix:
@@ -1442,6 +1608,9 @@ def main():
             patch_google_trim(root)
         if not a.no_purchase_trim:
             patch_purchase_card(root)
+        if not a.no_dialog_trim:
+            patch_app_dialogs(root)
+            patch_other_group(root)
         if a.package_name:
             patch_package(root, a.package_name)
         patch_app_version(root, a.commons_version)
