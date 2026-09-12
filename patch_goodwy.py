@@ -186,19 +186,12 @@ def drop_branch(src, cond):
     用大括号配平定位, 不依赖固定行数 —— 分支内部嵌套再多 {} 也不会截错。
     """
     msk = _mask(src)
-    out, n = src, 0
-    while True:
-        msk = _mask(out)
-        # 优先匹配 else if 形态(它前面有 "} ")
-        m = re.search(r'(?m)^([ \t]*)\} else if \(' + cond + r'\) \{', msk)
-        is_else = bool(m)
-        if not m:
-            m = re.search(r'(?m)^([ \t]*)if \(' + cond + r'\) \{', msk)
-            if not m:
-                break
+    rx = re.compile(r'(?m)^([ \t]*)(?:\} )?(else )?if \(' + cond + r'\) \{')
+    plan = []
+    for m in rx.finditer(msk):
         i = msk.rfind("{", m.start(), m.end())
         if i < 0:
-            break
+            continue
         depth, j = 0, i
         while j < len(msk):
             if msk[j] == "{":
@@ -209,16 +202,26 @@ def drop_branch(src, cond):
                     break
             j += 1
         if depth != 0:
-            break
-        if is_else:
-            # 从 "else" 起删到配对 '}' (含), 留下前面的 "} " 与后面的 " else {"
-            start = m.start() + m.group(0).index("else")
-            out = out[:start] + out[j + 1:]
-        else:
-            out = out[:m.start()] + out[j + 1:]
-        n += 1
-        if n > 8:      # 保险丝, 防止正则意外死循环
-            break
+            continue
+        if m.group(2):                      # "} else if (COND) { A }"
+            # 只删 "else if (...) { A }" 这一段, 留下前面的 "} " 与后面的 " else {"
+            plan.append((m.start() + m.group(0).index("else"), j + 1))
+            continue
+        # 独立的 if (COND) { A }: 后面若跟着 else 就不能只删 if 那段 ——
+        # 删完会剩一个孤儿 ` else { ... }`, 语法直接崩。这种情况原样保留:
+        # COND 已被抽空的实现置为 false, 运行时自然走 else 分支, 效果一样。
+        rest = msk[j + 1:]
+        k = 0
+        while k < len(rest) and rest[k] in " \t\r\n":
+            k += 1
+        if rest[k:k + 4] == "else":
+            continue
+        plan.append((m.start(), j + 1))
+
+    out = src
+    for start, end in sorted(plan, reverse=True):
+        out = out[:start] + out[end:]
+    n = len(plan)
     if n:
         out = re.sub(r'\}[ \t]{2,}else', '} else', out)
         out = re.sub(r'\n[ \t]*\n[ \t]*\n', '\n\n', out)
@@ -798,24 +801,72 @@ def patch_about_activity(root):
 
 
 # ------------------------------------------------------ 11. 语音输入(彻底删)
-def patch_speech_commons(root):
-    """commons 侧删掉语音转文字的底层实现。
+# 关键教训(实测踩过两轮):
+#   上一版在 commons 里"整段删除" fun Activity.speechToText / isSpeechToTextAvailable,
+#   再指望 app 侧把调用点一个个删干净。但 commons 和 app 是两次独立的 patch 运行
+#   (commons 先跑并发布到 mavenLocal), commons 根本无从知道 app 里还有谁在用 ——
+#   只要漏掉一个文件就是 Unresolved reference, 编译期才炸。MainActivity.kt 和
+#   NewConversationActivity.kt 就是这么漏的。
+#   所以改成"抽空实现"而不是"删除签名": 函数还在, 但 isSpeechToTextAvailable()
+#   恒返回 false、speechToText() 什么都不做。app 侧任何漏网的调用点都能编译,
+#   而且行为正确 —— 麦克风按钮 beVisibleIf(isSpeechToTextAvailable()) 自然是 gone。
+SPEECH_STUBS = (
+    (r'fun Activity\.isSpeechToTextAvailable\(',
+     '\n    // 语音输入已移除: 一律报告"不可用"\n    return false\n'),
+    (r'fun Activity\.speechToText\(',
+     '\n    // 语音输入已移除: 空实现, 不再拉起语音识别界面\n'),
+)
 
-    这两个是顶层扩展函数, 删掉后 app 侧所有调用点必须一并清理,
-    否则 ThreadActivity 会 Unresolved reference —— 所以 app 侧改动
-    (patch_speech_app) 必须配套执行。
+
+def _stub_fun(src, sig_pattern, body):
+    """把函数体换成 inert 实现。只动"块体"函数, 表达式体一律跳过。
+
+    为什么必须先判断函数体形态: fun_span 是"从签名末尾找第一个 '{'",
+    遇到 `fun x() = someCall { ... }` 这种表达式体, 它会把后面某个不相干的
+    块当成函数体, 整段替换掉 —— 属于改一个词毁一个文件的灾难。
     """
+    if not sig_pattern.startswith("^"):
+        sig_pattern = r"(?m)^[ \t]*" + MODIFIERS + sig_pattern
+    msk = _mask(src)
+    m = re.search(sig_pattern, msk)
+    if not m or msk[m.end() - 1] != "(":
+        return src, False
+    # 从签名里的 '(' 找到配对的 ')'
+    d, j = 0, m.end() - 1
+    while j < len(msk):
+        if msk[j] == "(":
+            d += 1
+        elif msk[j] == ")":
+            d -= 1
+            if d == 0:
+                break
+        j += 1
+    if d != 0:
+        return src, False
+    # ')' 之后允许 ": ReturnType", 然后必须紧跟 '{';
+    # 若先撞上 '=' 就是表达式体, 不碰它。
+    m2 = re.search(r'[={]', msk[j + 1:])
+    if not m2 or m2.group(0) != "{":
+        return src, False
+    return replace_fun_body(src, sig_pattern, body)
+
+
+def patch_speech_commons(root):
+    """commons 侧把语音输入的实现抽空(保留签名, 见本段顶部说明)。"""
     p = find_file(root, "commons/src/main/kotlin/com/goodwy/commons/extensions",
                   "Activity.kt")
     if not p:
-        warn("找不到 commons Activity.kt, 跳过语音输入删除")
+        warn("找不到 commons Activity.kt, 跳过语音输入处理")
         return
     src = read(p)
     n = 0
-    for sig in (r'fun Activity\.speechToText\(',
-                r'fun Activity\.isSpeechToTextAvailable\('):
-        src, ok = drop_fun(src, sig)
-        n += 1 if ok else 0
+    for sig, body in SPEECH_STUBS:
+        new, ok = _stub_fun(src, sig, body)
+        if ok:
+            src = new
+            n += 1
+        else:
+            warn("commons: 未能抽空 %s (签名变了或它是表达式体函数)" % sig)
     if n:
         # 判断"还有没有别处在用"时, 必须先把 import 那行本身摘掉再检查 ——
         # 否则 import 行自带的 "RecognizerIntent" 会让判断永远成立, import 永远删不掉。
@@ -823,10 +874,46 @@ def patch_speech_commons(root):
         if 'RecognizerIntent' not in body:
             src = body
         write(p, src)
-        log("commons: 已删除 %d/2 个语音输入函数 (speechToText / "
-            "isSpeechToTextAvailable)" % n)
+        log("commons: 已抽空 %d/2 个语音输入函数 (speechToText / "
+            "isSpeechToTextAvailable) —— 保留签名以免 app 侧 Unresolved reference"
+            % n)
     else:
-        warn("commons: 语音输入函数一个都没删掉, 请检查签名")
+        warn("commons: 语音输入函数一个都没抽空, 请检查签名")
+
+
+# 匹配 "if / else if (... isSpeechToTextAvailable ...)"。
+# 条件里允许 ! 、&& 连接、以及带括号的调用形式 isSpeechToTextAvailable() ——
+# 只写 'isSpeechToTextAvailable' 会漏掉带 () 的写法(drop_branch 的模板
+# 是 `if \(COND\) \{`, 多一对括号就匹配不上)。
+SPEECH_COND_AVAIL = (r'(?:[^()]|\([^()]*\))*isSpeechToTextAvailable\s*'
+                     r'(?:\([^()]*\))?(?:[^()]|\([^()]*\))*')
+
+P_DECL = r'(?m)^[ \t]*private var isSpeechToTextAvailable = false\n'
+P_ASSIGN = (r'(?m)^[ \t]*isSpeechToTextAvailable = if '
+            r'\(config\.useSpeechToText\).*\n')
+
+
+def _report_speech_left(root):
+    """清扫后复查还剩多少引用。
+
+    commons 侧已抽空(见 SPEECH_STUBS), 所以残留不会再导致编译失败,
+    只意味着"某个入口还没拿干净"(比如按钮仍绑着 speechToText)。
+    报出来给人确认, 不中断构建。
+    """
+    rx = re.compile(r'(?<![\w])isSpeechToTextAvailable|(?<![\w])speechToText')
+    left = []
+    for p in walk_files(os.path.join(root, "app", "src"), (".kt",)):
+        try:
+            lines = _mask(read(p)).split("\n")
+        except Exception:
+            continue
+        if any(rx.search(l) for l in lines):
+            left.append(rel(root, p))
+    if left:
+        warn("仍有 %d 个文件引用语音输入 (commons 已抽空, 不影响编译): %s"
+             % (len(left), left[:4]))
+    else:
+        log("语音输入: app 侧引用已全部清除")
 
 
 def patch_speech_app(root):
@@ -862,42 +949,45 @@ def patch_speech_app(root):
     else:
         warn("找不到 SettingsActivity.kt")
 
-    # --- ThreadActivity: 删分支 -> 再删声明/import ---
-    p = find_file(root, "app/src/main/kotlin/com/goodwy/smsmessenger/activities",
-                  "ThreadActivity.kt")
-    if not p:
-        warn("找不到 ThreadActivity.kt")
-        return
-    src = read(p)
+    # --- 全仓清扫: 不能只盯着 ThreadActivity ---
+    # 语音输入的调用点散落在 MainActivity / NewConversationActivity /
+    # ThreadActivity 好几个文件里, 写死文件名 = 漏一个就编译失败。
+    # 这里改成遍历 app/src 下所有 .kt, 同一套规则逐文件处理。
+    n_branch = n_result = n_decl = n_files = 0
+    for p in walk_files(os.path.join(root, "app", "src"), (".kt",)):
+        try:
+            src = read(p)
+        except Exception:
+            continue
+        if not any(k in src for k in ("isSpeechToTextAvailable", "speechToText",
+                                      "REQUEST_CODE_SPEECH_INPUT")):
+            continue
+        orig = src
+        src, c1 = drop_branch(src, SPEECH_COND_AVAIL)
+        src, c2 = drop_branch(src, r'requestCode == REQUEST_CODE_SPEECH_INPUT')
 
-    src, c1 = drop_branch(src, 'isSpeechToTextAvailable')
-    src, c2 = drop_branch(src, r'requestCode == REQUEST_CODE_SPEECH_INPUT')
-    log("ThreadActivity.kt: 已删除 %d 个语音分支 + %d 个识别结果回填块"
-        % (c1, c2))
+        # 只有分支清干净了才动声明/import, 否则会留 Unresolved reference。
+        # 注意: 判断残留时必须先把"声明行/赋值行本身"摘掉再检查 ——
+        # 它们自身就含 isSpeechToTextAvailable, 不摘掉会永远判定为有残留,
+        # 结果变量声明永远删不掉(正是上一版踩的坑)。
+        body = re.sub(P_DECL, '', src)
+        body = re.sub(P_ASSIGN, '', body)
+        if [l for l in body.split("\n") if 'isSpeechToTextAvailable' in l]:
+            body = src       # 还有引用, 声明必须留着
+        else:
+            n_decl += 1
+        body2 = re.sub(r'(?m)^import android\.speech\.RecognizerIntent\n', '', body)
+        if 'RecognizerIntent' not in body2:
+            body = body2
+        if body != orig:
+            write(p, body)
+            n_files += 1
+        n_branch += c1
+        n_result += c2
+    log("语音输入清扫: %d 个文件被改动 (删 %d 个可用分支 + %d 个结果回填块"
+        " + %d 处变量声明)" % (n_files, n_branch, n_result, n_decl))
 
-    # 只有分支清干净了才动声明/import, 否则会留 Unresolved reference。
-    # 注意: 判断残留时必须先把"声明行/赋值行本身"摘掉再检查 ——
-    # 它们自身就含 isSpeechToTextAvailable, 不摘掉会永远判定为有残留,
-    # 结果变量声明永远删不掉(正是上一版踩的坑)。
-    P_DECL = r'(?m)^[ \t]*private var isSpeechToTextAvailable = false\n'
-    P_ASSIGN = (r'(?m)^[ \t]*isSpeechToTextAvailable = if '
-                r'\(config\.useSpeechToText\).*\n')
-    body = re.sub(P_DECL, '', src)
-    body = re.sub(P_ASSIGN, '', body)
-    left = [l.strip() for l in body.split("\n") if 'isSpeechToTextAvailable' in l]
-    if left:
-        warn("ThreadActivity.kt 仍残留 %d 处引用, 保留变量声明以免编译失败: %s"
-             % (len(left), left[:2]))
-    else:
-        src = body
-        log("ThreadActivity.kt: 已删除变量声明与赋值")
-
-    body = re.sub(r'(?m)^import android\.speech\.RecognizerIntent\n', '', src)
-    if 'RecognizerIntent' not in body:
-        src = body
-        log("ThreadActivity.kt: 已删除 RecognizerIntent import")
-
-    write(p, src)
+    _report_speech_left(root)
 
 
 # -------------------------------------------------- 8b. 更新日志 (What's New)
