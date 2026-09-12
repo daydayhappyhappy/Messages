@@ -336,10 +336,30 @@ ANDROID_16_SDK = "36"
 SDK_KEYS = ("app-build-compileSDKVersion", "app-build-targetSDK",
             "app-build-minimumSDK")
 
+# META-INF 里几样 release 用不到的东西。
+# 说明白收益: DebugProbesKt.bin 是 kotlinx-coroutines 的调试探针, 只有
+# DebugProbes.install() 那种 IDE 协程调试才需要, 撑死 1~2 KB; 许可证文本同理。
+# 所以别指望靠它瘦身 —— 加它纯粹是因为"白给且零风险", 真正的体积大头在
+# classes.dex 和 resources.arsc, 得看体积诊断才知道。
+# 不删 .kotlin_module: 那是 Kotlin 模块元数据, 某些反射/序列化场景会读。
+PACKAGING_RES = (
+    "        resources {\n"
+    "            // 协程调试探针: kotlinx-coroutines 自带, 只有 IDE 协程调试用到。\n"
+    "            // 路径必须是裸文件名 —— 它落在 APK 根目录(官方 README 与\n"
+    "            // issue #2274 都确认), 早先写成 /META-INF/ 前缀等于没排除,\n"
+    "            // 于是这文件一直躺在 APK 里。官方原话: exclude it at no loss\n"
+    "            // of functionality, 排除它没有任何功能损失。\n"
+    "            excludes += \"DebugProbesKt.bin\"\n"
+    "            // 许可证文本: release 用不到\n"
+    "            excludes += \"/META-INF/{AL2.0,LGPL2.1}\"\n"
+    "        }\n"
+)
+
 # Android 16 起 Google Play 强制支持 16KB 内存页: so 必须页对齐且不压缩。
 # AGP 需要显式关掉 legacy packaging(默认压缩 so)才会按 16KB 对齐打包。
 PACKAGING_16KB = (
-    "    packaging {\n"
+    "    packaging {\n" +
+    PACKAGING_RES +
     "        jniLibs {\n"
     "            // Android 16: 16KB 页大小要求 so 不压缩且页对齐\n"
     "            useLegacyPackaging = false\n"
@@ -389,18 +409,42 @@ def patch_android16(root, sdk=ANDROID_16_SDK):
     if not os.path.exists(gb):
         return
     s = read(gb)
+    # 先补 resources 排除(幂等)。放在"已有配置就 return"之前, 否则
+    # 第二次跑进来会因为 useLegacyPackaging 已存在而直接跳过, 永远补不上。
+    s, added_res = _ensure_packaging_res(s)
+    if added_res:
+        log("build.gradle.kts: 已补上 META-INF 资源排除")
     if "useLegacyPackaging" in s:
         log("build.gradle.kts: 已有 16KB 打包配置, 跳过")
+        write(gb, s)
         return
     span = fun_span(s, r'android\s*\{')
     if not span:
         warn("build.gradle.kts: 未定位到 android 块, 跳过 16KB 页大小配置")
+        if s != read(gb):
+            write(gb, s)
         return
     j = span[1]
     head = s[:j]
     ins = PACKAGING_16KB if head.endswith("\n") else "\n" + PACKAGING_16KB
     write(gb, head + ins + s[j:])
     log("build.gradle.kts: 已启用 16KB 页大小对齐 (Android 16 强制要求)")
+
+
+def _ensure_packaging_res(s):
+    """已有 packaging 块时补上 resources 排除段; 没有 packaging 块就原样返回。
+
+    为什么要单独处理"已有块"的情况: packaging 块可能早就存在(比如上游自带
+    jniLibs 配置), 那时不能整块重插, 只能往里补一段。返回 (new_src, changed)。
+    """
+    span = fun_span(s, r'packaging\s*\{')
+    if not span:
+        return s, False
+    i = span[0]                      # '{' 的下标
+    body = s[i:span[1]]
+    if 'resources' in body:
+        return s, False
+    return s[:i + 1] + "\n" + PACKAGING_RES + s[i + 1:], True
 
 
 def patch_ispro_always_true(root):
@@ -1197,7 +1241,298 @@ def patch_sideload_dialog(root):
     # 这个定义一起注释掉 -> fun Activity.// xxx { -> 语法错误, 编译期才炸。
 
 
-# ------------------------------------------------------------------ 3. 语言精简
+# ------------------------------------------- "fake version" 盗版弹窗 (独立于签名认证)
+# 这是跟 AppSideloadedDialog 完全无关的另一套检测, 一共三处, 文案都是
+# "You are using a fake version of the app...":
+#
+#   1) BaseSimpleActivity.onCreate():
+#        if (!packageName.startsWith("com.goodwy.", true) && !isNewApp())
+#            if ((0..50).random() == 10 || appRunCount % 100 == 0) showModdedAppWarning()
+#      —— 改包名后 startsWith 恒 false, 条件恒真; 随机 1/51 或启动满 100 次触发。
+#      这就是为什么"之前不弹、改完包名开始弹"。
+#
+#   2) BaseSimpleActivity 定制页入口:
+#        if (!packageName.contains("ywdoog".reversed(), true))     // == "goodwy"
+#            if (appRunCount > 100) { showModdedAppWarning(); return }
+#      —— 把 "goodwy" 写成反转形式躲避字符串搜索; 且带 return, 弹完还会
+#         阻止进入定制页。
+#
+#   3) Compose 版 fakeVersionCheck(), 由 AppTheme.OnContentDisplayed() 调用,
+#      几乎覆盖所有 Compose 页面。
+#
+# 处理策略必须"抽空实现"而不是"改判断条件": 条件是运行时对 packageName 求值,
+# 而且作者用了反转字符串来防搜索, 靠正则改条件必然漏。把被调用的函数体抽空,
+# 无论哪条路径走进来都是空操作。
+FAKE_FUNCS = (
+    (r'fun BaseSimpleActivity\.showModdedAppWarning\(',
+     '\n    // 盗版检测已移除: 改包名后会误判, 不再弹窗\n'),
+    (r'fun Context\.fakeVersionCheck\(',
+     '\n    // 盗版检测已移除: 改包名后会误判, 不再弹窗\n'),
+)
+
+
+def patch_fake_version(root):
+    """干掉"You are using a fake version of the app"盗版弹窗(三处入口)。
+
+    两个函数不在一个文件里(showModdedAppWarning 在 extensions/Activity.kt,
+    fakeVersionCheck 在 compose/extensions/ActivityExtensions.kt), 所以不能
+    按固定路径找 —— 早先就是写死路径, 结果 Compose 那个根本没被碰到。
+    改成遍历 commons 下所有 .kt, 谁含这个签名就改谁。
+    """
+    # 首选做法: 直接删掉判定块。删掉后运行里连 packageName 判断都不执行,
+    # 无论上游再怎么改函数名/加调用点都不会弹 —— 这才是"根除"。
+    dropped = _drop_fake_branches(root)
+    _drop_fake_compose_call(root)
+
+    # 兜底: 判定块万一没匹配上(上游改了条件写法), 再把被调用的函数抽空,
+    # 保证"即便漏删分支也弹不出来"。两层是刻意叠加的, 不是重复劳动。
+    done = 0
+    for sig, body in FAKE_FUNCS:
+        hit = False
+        for p in walk_files(root, (".kt",)):
+            try:
+                src = read(p)
+            except Exception:
+                continue
+            if "盗版检测已移除" in src and re.search(sig, _mask(src)):
+                hit = True
+                break
+            new, ok = _stub_fun(src, sig, body)
+            if ok:
+                write(p, new)
+                hit = True
+                log("commons: 已抽空 %s (%s)"
+                    % (sig.split("\\")[-1].rstrip("("), rel(root, p)))
+                break
+        if hit:
+            done += 1
+        else:
+            warn("commons: 未找到/未能抽空 %s" % sig)
+    if done:
+        log("commons: 盗版弹窗函数已抽空 %d/%d 个" % (done, len(FAKE_FUNCS)))
+
+    # 定制页入口那处除了弹窗还带 return, 光抽空函数不够 ——
+    # return 仍会执行, 定制页永远进不去。整块删掉。
+    bsa = find_file(root, "commons/src/main/kotlin/com/goodwy/commons/activities",
+                    "BaseSimpleActivity.kt")
+    if bsa:
+        src = read(bsa)
+        new, k = drop_branch(src, r'baseConfig\.appRunCount > 100')
+        if k:
+            write(bsa, new)
+            log("commons: 定制页入口的盗版拦截已删除 (%d 处) "
+                "—— 否则 appRunCount>100 后连定制页都进不去" % k)
+    else:
+        warn("找不到 BaseSimpleActivity.kt, 定制页盗版拦截未处理")
+
+    # Compose 的 FakeVersionCheck() 由 AppTheme.OnContentDisplayed() 调用,
+    # 几乎覆盖所有 Compose 页面。它本身只是把 fakeVersionCheck 的结果接到
+    # 弹窗 state 上 —— 上面已把 fakeVersionCheck 抽空, 所以这里其实已经
+    # 永远弹不出来了。但仍然空壳化它: 一是省掉每次进页面都建一次 dialog state,
+    # 二是让 FAKE_VERSION_APP_LABEL 变成无人引用(下面才能安全删掉)。
+    for p in walk_files(root, (".kt",)):
+        try:
+            src = read(p)
+        except Exception:
+            continue
+        if "盗版检测已移除" in src and re.search(r'fun FakeVersionCheck\(', _mask(src)):
+            break
+        new, ok = _stub_fun(src, r'fun FakeVersionCheck\(',
+                            '\n    // 盗版检测已移除: 不显示\n')
+        if ok:
+            write(p, new)
+            log("commons: FakeVersionCheck (Compose 入口) 已空壳化 (%s)"
+                % rel(root, p))
+            break
+
+    _drop_fake_version_label(root)
+
+
+# 盗版检测的 if 判定块。直接删掉整块, 而不是只把被调用的函数抽空 ——
+# 抽空只是"弹窗变空操作", 判断逻辑每次 onCreate 仍会跑一遍; 删块才是
+# 连判断都不存在。
+#
+# 两处条件的写法都值得记一笔:
+#   第一处直接判断 packageName.startsWith("com.goodwy."), 改包名后恒 false ->
+#   取反后恒 true, 于是"改完包名才开始弹"。
+#   第二处把 "goodwy" 写成 "ywdoog".reversed() —— 作者刻意反转来躲避字符串
+#   搜索, 所以只搜 "goodwy" 是搜不到的。
+FAKE_BRANCH_CONDS = (
+    r'!packageName\.startsWith\("com\.goodwy\.", true\) && !isNewApp\(\)',
+    r'!packageName\.contains\("ywdoog"\.reversed\(\), true\)',
+)
+
+# 定位 if 块头。用"找配对括号"而不是"一行正则": 条件可能跨行(上游真就写成了
+# if (\n  !packageName... \n) { 这种三行形态), 一行正则直接漏掉。
+IF_HEAD_RX = re.compile(r'(?m)^([ \t]*)(?:\} )?(else )?if\s*\(')
+
+# 判定"这是盗版检测块"的两个依据, 命中任一即可:
+#   1) 块内调用了 showModdedAppWarning / fakeVersionCheck
+#   2) 块头条件(取原文, 不取 mask)匹配盗版判定的特征写法
+#
+# 依据 2 不能少: 有一处变种是"静默 finish()" —— 不弹窗, 点了选色直接关闭
+# Activity, 块里一个盗版函数调用都没有, 只按依据 1 会整个漏掉。
+#
+# 依据 2 必须极度精确, 否则会误删功能逻辑。踩过的坑: 早先只搜 "com.goodwy."
+# 这个子串, 结果把 MyContactsContentProvider 里的联系人访问白名单
+#   if (packageName != "com.goodwy.dialer" && ...) return contacts
+# 当成盗版检测删了 —— 那是"只允许自家 app 读联系人"的安全校验, 删掉等于
+# 任何 app 都能通过 ContentProvider 拿到联系人。性质比弹窗严重得多。
+#
+# 区分点在于: 盗版判定用的是"前缀通配 + 忽略大小写"的否定式
+#   !packageName.startsWith("com.goodwy.", true)      <- 前缀, 带 , true
+#   !packageName.contains("ywdoog".reversed(), true)  <- 反转串, 带 , true
+# 而功能逻辑用的是"全等比较", 带具体后缀, 不带 , true:
+#   packageName != "com.goodwy.dialer"
+#   !packageName.startsWith("com.goodwy.contacts")    <- 有后缀, 非通配
+# 所以这里把 `, true`(ignoreCase 参数) 和确切字符串写进模式来区分。
+FAKE_CALL_RX = re.compile(r'showModdedAppWarning\s*\(|fakeVersionCheck\s*\(')
+FAKE_COND_LIT_RX = re.compile(
+    r'!\s*packageName\s*\.\s*startsWith\s*\(\s*"com\.goodwy\."\s*,\s*true\s*\)'
+    r'|!\s*packageName\s*\.\s*contains\s*\(\s*"ywdoog"\s*\.\s*reversed\s*\(\s*\)'
+    r'\s*,\s*true\s*\)')
+
+
+def _drop_fake_branches(root):
+    """删掉盗版检测的 if 判定块(整块, 含嵌套的内层 if)。
+
+    按"块内是否调用 showModdedAppWarning / fakeVersionCheck"来判定, 而不是
+    按条件字符串匹配 —— 上游改了条件写法也能命中。
+    """
+    total = 0
+    for p in walk_files(root, (".kt",)):
+        try:
+            src = read(p)
+        except Exception:
+            continue
+        msk = _mask(src)
+        spans = []
+        for m in IF_HEAD_RX.finditer(msk):
+            # 从 '(' 找配对的 ')'
+            lp = m.end() - 1
+            d, rp = 0, lp
+            while rp < len(msk):
+                if msk[rp] == "(":
+                    d += 1
+                elif msk[rp] == ")":
+                    d -= 1
+                    if d == 0:
+                        break
+                rp += 1
+            if d != 0:
+                continue
+            # ')' 之后跳过空白与换行, 必须是 '{' 才是块形态(不是 if (x) foo())
+            k = rp + 1
+            while k < len(msk) and msk[k] in " \t\r\n":
+                k += 1
+            if k >= len(msk) or msk[k] != "{":
+                continue
+            depth, j = 0, k
+            while j < len(msk):
+                if msk[j] == "{":
+                    depth += 1
+                elif msk[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if depth != 0:
+                continue
+            is_fake = (FAKE_CALL_RX.search(msk[k:j + 1])
+                       or FAKE_COND_LIT_RX.search(src[m.start():k + 1]))
+            if not is_fake:
+                continue
+            # 后面若紧跟 else 就不能只删 if 那段 —— 会剩孤儿 else, 语法崩。
+            # 这种情况交给"抽空函数"兜底, 效果一样(条件恒走不到弹窗)。
+            rest = msk[j + 1:]
+            k2 = 0
+            while k2 < len(rest) and rest[k2] in " \t\r\n":
+                k2 += 1
+            if rest[k2:k2 + 4] == "else":
+                continue
+            # "} else if (...) {" 形态: 只删 else 之后那一段
+            start = (m.start() + m.group(0).index("else")) if m.group(2) else m.start()
+            spans.append((start, j + 1))
+        if not spans:
+            continue
+        # 只保留最外层: 盗版检测是 if 里套 if, 内外两层的块内都能搜到
+        # showModdedAppWarning, 于是都进了 spans。若两层都删, 内层先删会把
+        # 外层的 end 下标整个前移, 外层再按旧下标删就多切走几个 '}' ——
+        # 实测留下 '{' 比 '}' 少 3 个, 编译期才炸。所以必须丢掉被包含的。
+        outer = [s for s in spans
+                 if not any(o is not s and o[0] < s[0] and s[1] <= o[1]
+                            for o in spans)]
+        out = src
+        for start, end in sorted(outer, reverse=True):
+            out = out[:start] + out[end:]
+        write(p, out)
+        total += len(outer)
+    if total:
+        log("commons: 盗版检测判定块已直接删除 (%d 处) "
+            "—— 连 packageName 判断都不再执行" % total)
+    return total
+
+
+def _drop_fake_compose_call(root):
+    """删掉 AppTheme 里 FakeVersionCheck() 的调用行, 以及随之失效的 import。
+
+    只删调用、不删定义: 定义留着无害(R8 会 shrink), 删了反而可能在别的
+    模块引用时炸 unresolved reference。
+
+    import 也要跟着删 —— 调用没了以后它是个孤立的未使用 import, 留着只是
+    让"盗版检测"这几个字继续出现在源码里。
+    """
+    call_rx = re.compile(r'(?m)^[ \t]*FakeVersionCheck\(\)[ \t]*\n')
+    imp_rx = re.compile(
+        r'(?m)^import\s+[\w.]*\.?FakeVersionCheck\s*\n')
+    n = 0
+    for p in walk_files(root, (".kt",)):
+        try:
+            s = read(p)
+        except Exception:
+            continue
+        s, k = call_rx.subn('', s)
+        if not k:
+            continue
+        # 删掉调用后, 若本文件里 FakeVersionCheck 只剩 import 那一次出现,
+        # 说明这个 import 已经没人用了, 一并删掉。
+        if s.count("FakeVersionCheck") <= 1:
+            s, _ = imp_rx.subn('', s)
+        write(p, s)
+        n += k
+    return n
+# 引用了。留着的话 "You are using a fake version of the app..." 这串文案会原样
+# 躺在 dex 里 —— 虽然永远不会显示, 但反编译/商店扫描看得见, 属于该清的残留。
+FAKE_LABEL_RX = re.compile(
+    r'(?m)^const val FAKE_VERSION_APP_LABEL\s*=\s*\n?\s*"[^"]*"\n')
+
+
+def _drop_fake_version_label(root):
+    """删掉 FAKE_VERSION_APP_LABEL 常量 —— 前提是没有别处在引用它。"""
+    for p in walk_files(root, (".kt",)):
+        try:
+            s = read(p)
+        except Exception:
+            continue
+        if "FAKE_VERSION_APP_LABEL" not in s:
+            continue
+        if not FAKE_LABEL_RX.search(s):
+            continue
+        # 全仓计数: 定义 1 次 + 引用 N 次。只有恰好 1 次(即纯定义)才删,
+        # 免得误删导致 Unresolved reference。
+        uses = 0
+        for q in walk_files(root, (".kt",)):
+            try:
+                uses += read(q).count("FAKE_VERSION_APP_LABEL")
+            except Exception:
+                pass
+        if uses > 1:
+            warn("FAKE_VERSION_APP_LABEL 仍被引用 %d 次, 保留以免编译失败" % uses)
+            return 0
+        write(p, FAKE_LABEL_RX.sub('', s))
+        log("commons: 已删除 FAKE_VERSION_APP_LABEL 文案常量 (不再有人引用)")
+        return 1
+    return 0
 NON_LANG_QUAL = {
     "night", "notnight", "land", "port", "square", "round",
     "ldpi", "mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi", "nodpi", "tvdpi", "anydpi",
@@ -1894,8 +2229,17 @@ def patch_italic(root):
 # 这是斜体改造留下的: 原本靠 BOLD_ITALIC 区分定时短信, 斜体改成 BOLD 后
 # 两个分支就相等了。恒等于 X, 折叠掉纯属等价化简。
 # 不碰跨行、不碰 else if 链、不碰分支里带调用/花括号的, 避免误判语义。
+# 两个分支就相等了。恒等于 X, 折叠掉纯属等价化简。
+# 不碰跨行、不碰 else if 链、不碰分支里带调用/花括号的, 避免误判语义。
+#
+# 末尾的 (?![A-Za-z0-9_.]) 是必须的, 之前漏了它: 原正则用 \1\b 收尾, 而
+# `if (noContrastColor) baseColor else baseColor.getContrastColor()` 里
+# \1 匹配到第二个 baseColor 后, 紧跟的 '.getContrastColor()' 恰好让 \b 成立,
+# 于是被误判成"两分支相同", 折叠后丢掉 .getContrastColor(), 颜色值静默变错。
+# 这类 bug 不报编译错、只改运行时行为, 最难查, 所以负向前瞻不能省。
 DEAD_BRANCH_RX = re.compile(
-    r'\bif\s*\((?:[^()]|\([^()]*\))*\)\s*([A-Za-z_][A-Za-z0-9_.]*)\s+else\s+\1\b')
+    r'\bif\s*\((?:[^()]|\([^()]*\))*\)\s*([A-Za-z_][A-Za-z0-9_.]*)\s+else\s+'
+    r'\1(?![A-Za-z0-9_.])')
 
 
 def _fold_dead_branches(root):
@@ -2205,7 +2549,7 @@ def _preflight():
     (本地跑得好好的), 到 3.12 才变成 re.error(构建机直接挂), 也就是说
     只有提交到 CI 才发现 —— 一轮构建几十分钟。这里提前炸, 成本一秒。
     """
-    pats = [p for p, _ in SPEECH_STUBS] + [
+    pats = [p for p, _ in SPEECH_STUBS] + [p for p, _ in FAKE_FUNCS] + [
         r'private fun setupUseSpeechToText\(',
         r'fun Context\.isPro\(\)',
         r'fun Long\.formatDateOrTime\(',
@@ -2261,6 +2605,9 @@ def main():
                          "hide_google_relations)")
     ap.add_argument("--no-sideload-trim", action="store_true",
                     help="保留签名认证弹窗 (默认去掉「应用已损坏」弹窗)")
+    ap.add_argument("--no-fake-version-check", action="store_true",
+                    help="保留盗版检测弹窗 (默认去掉「You are using a fake version」)。"
+                         "改包名后此检测会 100%% 误判, 强烈建议保持默认")
     ap.add_argument("--no-dialog-trim", action="store_true",
                     help="保留更新日志 / 新应用推荐 / 数据访问披露三类弹窗 (默认全部去掉)")
     ap.add_argument("--no-unlock-pro", action="store_true",
@@ -2307,6 +2654,11 @@ def main():
             patch_res_languages(root)
         if not a.no_sideload_trim:
             patch_sideload_dialog(root)
+        # 盗版弹窗与签名认证是两套独立检测, 必须单独开关:
+        # 早先把它挂在 patch_sideload_dialog() 里, 一旦传入 --no-sideload-trim
+        # 就会连带跳过, 盗版弹窗又冒出来 —— 而这恰恰是改包名后必现的那个。
+        if not a.no_fake_version_check:
+            patch_fake_version(root)
         if not a.no_dialog_trim:
             patch_whatsnew_commons(root)
         if not a.no_google_trim:
