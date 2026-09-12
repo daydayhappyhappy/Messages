@@ -8,14 +8,14 @@ on:
         required: true
         default: 'M-d-yyyy'
       date_mode:
-        description: 'full=所有短信统一显示日期(今天也显示日期) / keep-year=今天仍显示时间,但不再隐藏年份'
+        description: 'full=所有短信统一显示日期(今天也显示日期) / keep-year=今天仍显示时间, 但不再隐藏年份'
         type: choice
         options: [full, keep-year]
         default: full
       flavor:
-        description: '构建渠道: foss=无 Google 内购(推荐) / gplay / rustore。只构建单渠道可避免 Room schema 并发写坏'
+        description: '构建渠道。只留 foss(无 Google 内购), 避免误选 gplay/rustore 引入内购入口'
         type: choice
-        options: [foss, gplay, rustore]
+        options: [foss]
         default: foss
       package_name:
         description: '改包名 (如 com.mycompany.sms)。留空=保持 com.goodwy.smsmessenger。改后与官方版可共存安装'
@@ -78,11 +78,11 @@ on:
         type: boolean
         default: true
       keep_purchase_page:
-        description: '保留 foss 的项目支持页 (默认勾 false = 空壳化, 因为入口已隐藏且无需购买)'
+        description: '保留 foss 的项目支持页 (默认 false = 空壳化, 因为入口已隐藏且无需购买)'
         type: boolean
         default: false
       keep_speech:
-        description: '保留语音输入 (默认勾 false = 彻底删除: 设置项 + 麦克风按钮 + 长按 + 结果回填)'
+        description: '保留语音输入 (默认 false = 彻底删除: 设置项 + 麦克风按钮 + 长按 + 结果回填)'
         type: boolean
         default: false
 
@@ -107,6 +107,17 @@ jobs:
           if [ ! -f "$GITHUB_WORKSPACE/patch_goodwy.py" ]; then
             echo "::error::仓库根目录缺少 patch_goodwy.py, 请把它一起提交上来"
             exit 1
+          fi
+          # 防呆: 收尾模块没接进去的话, 会编出"签名弹窗复活 + 购买页还在"的 APK,
+          # 与其装到手机上才发现, 不如在这里就拦下来。
+          if ! grep -q 'def patch_final_clean' patch_goodwy.py; then
+            echo "::error::patch_goodwy.py 里没有 patch_final_clean 定义, 收尾清理不会执行"
+            exit 1
+          fi
+          CNT=$(grep -c 'patch_final_clean(' patch_goodwy.py || true)
+          if [ "${CNT:-0}" -lt 3 ]; then
+            echo "::warning::patch_final_clean 疑似只接了 1 处(需 commons 分支 + app 分支各调一次)"
+            echo "::warning::只清 app 侧 = commons 的 PurchaseActivity 和 BaseSimpleActivity 里的弹窗调用还在"
           fi
           python3 -c "import sys; print('python', sys.version.split()[0])"
 
@@ -185,7 +196,7 @@ jobs:
           echo "--- mavenLocal 里的产物 ---"
           find ~/.m2/repository/com/github/goodwy -name "*.aar" -o -name "*.pom" | sort
 
-      - name: Patch app (关于入口 + 语言 + 斜体 + 版本指向)
+      - name: Patch app (关于入口 + 语言 + 斜体 + 版本指向 + 收尾清理)
         run: |
           set -e
           FLAGS=""
@@ -217,30 +228,45 @@ jobs:
             --date-mode "${{ inputs.date_mode }}" \
             --commons-version 99.0.0-custom $FLAGS $LOCALES $PKGARG
 
-      - name: Patch 自检 (源码层面确认改动落盘了)
+      - name: Patch 自检 (源码改动 + 收尾清理, 日志里直接看是否干净)
         run: |
-          echo "=== 日期格式常量 ==="
-          grep -h "const val DATE_FORMAT_" "$RUNNER_TEMP/commons/commons/src/main/kotlin/com/goodwy/commons/helpers/Constants.kt" | head -4
-          echo "=== 主菜单 about ==="
-          grep -A2 '@+id/about' app/src/main/res/menu/menu_main.xml || echo "(about 已不存在)"
-          echo "=== 剩余语言目录 ==="
-          ls app/src/main/res | grep '^values' | tr '\n' ' '; echo
-          echo "=== 残留斜体 ==="
+          # 说明: 全部用 || true, 避免 bash -e 下 grep 无匹配时把整个 step 打断
+          CM="$RUNNER_TEMP/commons/commons/src/main/kotlin/com/goodwy/commons"
+          echo "=== [1] 日期格式常量(应全部相同) ==="
+          grep -h 'const val DATE_FORMAT_' "$CM/helpers/Constants.kt" | sort -u
+          echo "=== [2] 波斯历残留(应为空) ==="
+          grep -rn 'PersianDate\|Shamsi(' "$CM/extensions/Long.kt" || echo "(已清除)"
+          echo "=== [3] 主菜单 about 入口(应不存在) ==="
+          grep -A2 '@+id/about' app/src/main/res/menu/menu_main.xml || echo "(已移除)"
+          echo "=== [4] 剩余语言目录 ==="
+          ls app/src/main/res | grep '^values' | tr '\n' ' ' || true; echo
+          echo "=== [5] 残留斜体(应为空) ==="
           grep -rn 'textStyle="italic"\|Typeface.ITALIC\|>italic<' app/src --include=*.xml --include=*.kt | head -10 || echo "(无残留)"
-          echo "=== ABI 过滤 ==="
-          grep -A2 "abiFilters" app/build.gradle.kts || echo "(未生效)"
-          echo "=== 非手机资源目录(应为空) ==="
+          echo "=== [6] ABI 过滤 ==="
+          grep -A2 'abiFilters' app/build.gradle.kts || echo "(未生效)"
+          echo "=== [7] 非手机资源目录(应为空) ==="
           ls app/src/main/res | grep -E 'sw600dp|television|xlarge' || echo "(已清空)"
-          echo "=== 波斯历残留(commons, 应为空) ==="
-          grep -rn 'PersianDate\|Shamsi(' "$RUNNER_TEMP/commons/commons/src/main/kotlin/com/goodwy/commons/extensions/Long.kt" || echo "(已清除)"
-          echo "=== 包名 ==="
-          grep '^APP_ID' gradle.properties
-          echo "=== 购买卡片(应全为 beGone, 且无 .beGone()) 语法错误) ==="
-          grep -n 'PurchaseThankYouHolder.beGone\|TipJarHolder.beGone' app/src/main/kotlin/*/activities/SettingsActivity.kt 2>/dev/null | head -5 || echo "(未找到, 用 find 再试)"
-          echo "=== 购买卡片(应已 gone) ==="
-          grep -A1 'settingsPurchaseThankYouHolder"' app/src/main/res/layout/activity_settings.xml | head -2
-          echo "=== 日期格式常量(应全部相同) ==="
-          grep -h 'const val DATE_FORMAT_' "$RUNNER_TEMP/commons/commons/src/main/kotlin/com/goodwy/commons/helpers/Constants.kt" | sort -u
+          echo "=== [8] 包名 ==="
+          grep '^APP_ID' gradle.properties || true
+          echo "=== [9] 签名弹窗调用(app, 应只剩 Unit) ==="
+          grep -rn 'showSideloadingDialog' app/src --include=*.kt | grep -v '\bfun\b' || echo "(已全部置空)"
+          echo "=== [10] 签名弹窗调用(commons, 应只剩 Unit) ==="
+          grep -rn 'showSideloadingDialog' "$RUNNER_TEMP/commons" --include=*.kt | grep -v '\bfun\b' || echo "(已全部置空)"
+          echo "=== [11] 内购 Key(应为空) ==="
+          if [ -f local.properties ]; then
+            grep -iE 'RIGHT_APP_KEY|PRODUCT_ID|SUBSCRIPTION|BILLING|LICENSE_KEY' local.properties || echo "(无内购字段)"
+          else
+            echo "(local.properties 尚未生成, 由 gradle 在构建时创建)"
+          fi
+          echo "=== [12] 收费入口(应为 gone) ==="
+          grep -A1 'settingsPurchaseThankYouHolder\|settingsTipJarHolder' app/src/main/res/layout/activity_settings.xml || echo "(已移除)"
+          echo "=== [13] 购买页 onCreate(应为 finish) ==="
+          grep -rln 'finish()  // 购买页已精简' "$RUNNER_TEMP/commons" app/src || echo "(未找到, 检查 PurchaseActivity 路径)"
+          echo "=== [14] 内购文案残留(应为空: 内容已被清空) ==="
+          grep -rE '<string name="[^"]*(purchase|thank_you|tip_jar|tipjar|donate|donation)[^"]*">[^<]+<' \
+            "$RUNNER_TEMP/commons" app/src/main/res 2>/dev/null || echo "(已全部清空)"
+          echo "=== [15] 付费渠道源集(应已删除) ==="
+          ls -d app/src/gplay app/src/rustore 2>/dev/null || echo "(已删除, 只剩 foss)"
 
       - name: Build release APK
         run: |
@@ -279,6 +305,9 @@ jobs:
           ls -lh RightMessages-custom.apk
           echo "=== APK 实际支持的语言 ==="
           "${BT}aapt2" dump badging RightMessages-custom.apk | grep -i "^locales" || echo "(未取到, 忽略)"
+          echo "=== APK 内购痕迹(应为空: 否则开源商店会判含内购) ==="
+          "${BT}aapt2" dump badging RightMessages-custom.apk \
+            | grep -iE 'vending\.BILLING|billingclient' || echo "(无 BILLING 权限, 可被开源商店收录)"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
