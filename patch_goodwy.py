@@ -97,11 +97,6 @@ def _mask(src):
     return pat.sub(blank, src)
 
 
-MODIFIERS = (r"(?:(?:private|internal|override|public|protected|open|suspend|"
-            r"inline|operator|abstract|final|actual|expect|tailrec|external|"
-            r"infix|internal)\s+)*")
-
-
 def fun_span(src, sig_pattern):
     """按签名定位函数体: 返回 (body_start, body_end)。
     body_start 是 '{' 的下标, body_end 是配对的 '}' 的下标。"""
@@ -984,10 +979,10 @@ def patch_sideload_dialog(root):
         log("commons: AppSideLoadedAlertDialog (Compose 版) 已空壳化")
     write(p, src)
 
-    # 注意: 不要去注释 showSideloadingDialog() 的"调用点"。
-    # Activity.kt 里有 `fun Activity.showSideloadingDialog() {` 这个定义,
-    # 朴素正则会连它一起注释掉 -> fun Activity.// xxx { -> 语法错误。
-    # 而且入口已经空壳化(直接 callback), 调用它本身是无害的, 不需要动。
+    # 调用点不在本函数里处理 —— 留给收尾的 _clean_sideload_calls(),
+    # 它会把 showSideloadingDialog() / checkAppSideloading() 的调用整体换成 Unit。
+    # 必须走那里而不是这里: 朴素正则会连 `fun Activity.showSideloadingDialog() {`
+    # 这个定义一起注释掉 -> fun Activity.// xxx { -> 语法错误, 编译期才炸。
 
 
 # ------------------------------------------------------------------ 3. 语言精简
@@ -1296,10 +1291,6 @@ def patch_other_group(root):
 
 
 # ------------------------------------------------- 9. 购买 Thank You / 内购
-PURCHASE_KEYS = ("purchase", "thank_you", "thankyou", "donate",
-                 "contribute", "support_us", "become_", "tip_jar")
-
-
 def patch_purchase_card(root):
     """删掉设置页里的「购买 Thank You」卡片和「小费罐 / Tip Jar」。
 
@@ -1756,6 +1747,204 @@ def set_view_gone(xml_text, view_id):
     return (xml_text[:m.start(3)] + attrs + m.group(4) + ">" + xml_text[m.end():], True)
 
 
+# ------------------------------------------------------- 12. 收尾清理 (两侧都跑)
+# 为什么必须放最后, 而且 commons / app 两侧各跑一次:
+#   A) 签名/侧载认证: 前面的 patch 只把 AppSideloadedDialog 空壳化了,
+#      "调用点"还原样留在源码里。改包名之后更是处处是雷 —— 自签名 +
+#      非商店安装来源, 任何一处 checkAppSideloading() 被走到, 都可能把
+#      「应用已损坏, 请从商店重新下载」再拉回来。把调用点换成 Unit 才叫断根。
+#   B) 收费/内购痕迹: 卡片设成 gone 只是"看不见", BILLING 权限和付费文案
+#      照样原封不动躺在 APK 里。开源商店(F-Droid / IzzyOnDroid)的收录扫描
+#      认的就是这两个 —— manifest 里的 com.android.vending.BILLING, 和
+#      resources.arsc 里的 "Purchase Thank You" / "Tip Jar" / "Donate"。
+SIDELOAD_FUNCS = ("showSideloadingDialog", "checkAppSideloading")
+
+# 允许带接收者: showSideloadingDialog() / requireActivity().showSideloadingDialog()
+SIDELOAD_CALL_RX = re.compile(
+    r'(?<![\w$.])(?:(?:[A-Za-z_][A-Za-z0-9_]*)'
+    r'(?:\s*\((?:[^()]|\([^()]*\))*\))?\s*\.\s*)?'
+    r'(?:' + '|'.join(SIDELOAD_FUNCS) + r')\s*\((?:[^()]|\([^()]*\))*\)')
+
+PAY_NAME_KEYS = ("purchase", "thank_you", "thankyou", "tip_jar", "tipjar",
+                 "donate", "donation", "subscrib", "billing", "in_app",
+                 "patreon", "paypal", "support_us", "contribute",
+                 "become_", "pro_version", "unlock_pro")
+
+
+def _clean_sideload_calls(root):
+    """把签名/侧载认证的调用点整体替换成 Unit (定义行 / import / 注释不动)。
+
+    注意: 不能去动 fun 定义本身 —— 上一版就是把
+    `fun Activity.showSideloadingDialog() {` 注释掉一半, 编出语法错误,
+    白跑一整轮 CI。这里只吃"调用", 定义原样留着。
+    """
+    total, files = 0, 0
+    for p in walk_files(root, (".kt", ".java")):
+        try:
+            out = read(p)
+        except Exception:
+            continue
+        msk = _mask(out)
+        hits = []
+        for m in SIDELOAD_CALL_RX.finditer(msk):
+            ls = msk.rfind("\n", 0, m.start()) + 1
+            le = msk.find("\n", m.end())
+            if le < 0:
+                le = len(msk)
+            line = out[ls:le]
+            if re.search(r'\bfun\b', line):         # 函数定义, 一律不碰
+                continue
+            if line.strip().startswith(("import", "//", "*", "/*")):
+                continue
+            hits.append((m, le))
+        if not hits:
+            continue
+        # 倒序替换: 后改的不影响前面的下标, 一次遍历即可, 不用反复 _mask
+        for m, le in reversed(hits):
+            tail = out[m.end():le].strip()
+            # 同行后面还有代码就别加行注释, 否则把后面的代码一起吃掉
+            repl = "Unit  // 签名认证已移除" if tail in ("", ";") else "Unit"
+            out = out[:m.start()] + repl + out[m.end():]
+        write(p, out)
+        total += len(hits)
+        files += 1
+    if total:
+        log("收尾: 签名/侧载认证调用点已置空 %d 处 (%d 个文件)" % (total, files))
+    else:
+        log("收尾: 未发现签名/侧载认证调用点 (只剩函数定义)")
+    return total
+
+
+def _clean_billing_manifest(root):
+    """删掉 com.android.vending.BILLING 权限 —— 商店判定「含内购」的第一证据。"""
+    pat = re.compile(
+        r'[ \t]*<uses-permission\b[^>]*?com\.android\.vending\.BILLING[^>]*?/?>[ \t]*\n?',
+        re.I)
+    n = 0
+    for p in walk_files(root, (".xml",)):
+        if os.path.basename(p) != "AndroidManifest.xml":
+            continue
+        try:
+            s = read(p)
+        except Exception:
+            continue
+        new, k = pat.subn('', s)
+        if k:
+            write(p, new)
+            n += k
+            log("收尾: %s 已删除 BILLING 权限 (%d 处)" % (rel(root, p), k))
+    if not n:
+        log("收尾: 未发现 com.android.vending.BILLING 权限 (foss 渠道本就没有)")
+    return n
+
+
+def _clean_payment_strings(root):
+    """把内购相关字符串的"内容"清空 (保留 name, 免得 R.string 引用全断)。
+
+    清空内容而不是删条目, 是刻意的: name 还在, 任何 getString(R.string.xxx)
+    都照常编译通过, 只是拿到空串 —— 而那些卡片入口本来就已经被 gone 掉了。
+    按 name 匹配, 所以 values-zh-rCN / values-de 等各语种会一起被清干净。
+    """
+    pat = re.compile(r'(<string\s+name="([^"]+)"[^>]*>)(.*?)(</string>)', re.S)
+    total, cleared = 0, []
+    for p in walk_files(root, (".xml",)):
+        norm = p.replace("\\", "/")
+        if "/res/" not in norm:
+            continue
+        if not os.path.basename(os.path.dirname(norm)).startswith("values"):
+            continue
+        try:
+            s = read(p)
+        except Exception:
+            continue
+        seen = []
+
+        def repl(m):
+            name = m.group(2).lower()
+            if any(k in name for k in PAY_NAME_KEYS) and m.group(3).strip():
+                seen.append(m.group(2))
+                return m.group(1) + m.group(4)
+            return m.group(0)
+
+        new = pat.sub(repl, s)
+        if seen:
+            write(p, new)
+            total += len(seen)
+            cleared.extend(seen)
+    if total:
+        log("收尾: 已清空 %d 条内购文案, 例: %s"
+            % (total, ", ".join(sorted(set(cleared))[:4])))
+    else:
+        log("收尾: 未发现内购文案")
+    return total
+
+
+def _drop_paid_flavors(root):
+    """删掉 gplay / rustore 两个付费渠道的源集 (只在 app 侧调)。
+
+    只构建 foss, 这两个目录永远不参与编译; 但它们是内购代码的老巢
+    (BillingHelper、gplay 版 PurchaseActivity、带 BILLING 的 manifest)。
+    留在源码树里, 任何源码级扫描都会说"这应用带内购"。
+    注意: 不要对 commons 做这件事 —— commons 的 gplay 源集可能提供被 main
+    源集引用的符号(如 isProVersion 的实现), 删了大概率编不过; 而它按
+    flavor 发布, 本来也进不了 foss 的 AAR。
+    """
+    targets = []
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in (".git", "build", ".gradle", ".idea")]
+        if os.path.basename(dp) == "src":
+            targets += [os.path.join(dp, d) for d in dn if d in ("gplay", "rustore")]
+    for t in targets:
+        shutil.rmtree(t, ignore_errors=True)
+    if targets:
+        log("收尾: 已删除付费渠道源集 %s"
+            % ", ".join(rel(root, t) for t in targets))
+    else:
+        log("收尾: 未发现 gplay/rustore 源集")
+    return len(targets)
+
+
+def _report_pkg_leftover(root, new_pkg, old_pkg=DEFAULT_OLD_PKG):
+    """改包名后复查: 全仓还有没有旧包名的漏网之鱼。
+
+    patch_package 只改 .kt/.java/.xml/.kts/.pro, 而 .properties/.gradle/
+    .json 里也可能埋着旧包名(比如 manifestPlaceholders、deep link scheme),
+    这些地方漏改 = 运行时 ClassNotFound 或 authority 冲突, 且编译期不报错。
+    """
+    if not new_pkg or new_pkg == old_pkg:
+        return
+    left = []
+    for p in walk_files(root, (".kt", ".java", ".xml", ".kts", ".gradle",
+                               ".properties", ".pro", ".json")):
+        try:
+            s = read(p)
+        except Exception:
+            continue
+        if old_pkg in s:
+            left.append(rel(root, p))
+    if left:
+        warn("改包名后仍有 %d 个文件残留 %s: %s" % (len(left), old_pkg, left[:3]))
+    else:
+        log("改包名: 全仓已无 %s 残留" % old_pkg)
+
+
+def patch_final_clean(root, new_pkg=None, drop_flavors=False):
+    """收尾清理: 签名认证残留 + 内购痕迹, 一次清干净。
+
+    顺序很关键, 必须排在最后:
+      - 早于 patch_package, 改包名又会带出新的引用;
+      - 早于 patch_res_languages, 刚清空的文案目录可能又被重建。
+    commons 与 app 各调一次(commons 自带 strings 模块, 付费文案一大半在那)。
+    """
+    log("--- 收尾清理 (%s) ---" % os.path.basename(root.rstrip("/")))
+    _clean_sideload_calls(root)
+    _clean_billing_manifest(root)
+    _clean_payment_strings(root)
+    if drop_flavors:
+        _drop_paid_flavors(root)
+    _report_pkg_leftover(root, new_pkg)
+
+
 # ------------------------------------------------------------------ main
 def main():
     ap = argparse.ArgumentParser()
@@ -1839,6 +2028,7 @@ def main():
             patch_google_trim(root)
         if not a.no_italic_fix:
             patch_italic(root)
+        patch_final_clean(root)
     else:
         log("=== patch app (%s) ===" % os.path.basename(root.rstrip("/")))
         patch_local_properties(root, os.environ.get("ANDROID_HOME"))
@@ -1873,6 +2063,7 @@ def main():
             patch_device_res(root)
         if not a.no_italic_fix:
             patch_italic(root)
+        patch_final_clean(root, a.package_name, drop_flavors=True)
 
     ok = verify_syntax(root)
     log("完成%s" % ("" if ok else " (但自检有问题, 见上面的 WARN)"))
