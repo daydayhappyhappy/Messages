@@ -336,6 +336,16 @@ ANDROID_16_SDK = "36"
 SDK_KEYS = ("app-build-compileSDKVersion", "app-build-targetSDK",
             "app-build-minimumSDK")
 
+# KSP 2.3.5 有个已知 bug: 处理结束后 IntelliJ PSI 的后台清理线程(AWT-EventQueue-0)
+# 在 Application 已销毁后仍去 getService(), 抛 NPE。抛在 AWT 线程而非构建主线程,
+# Gradle 捕获不到, 所以不影响产物 —— 官方 issue 标题即 "does not break build"
+# (google/ksp#2763)。但日志里一大片红字, 且掩盖真正的编译错误。
+# 官方已在 2.3.6 修掉, release note 原文: "Fixed a KSP version 2.3.5 CI error
+# exception that does not break build checks (#2763)"。
+# KSP 版本必须与 Kotlin 主版本对齐(2.3.x 对 2.3.x), 本项目 Kotlin 2.3.10,
+# 所以 2.3.5 -> 2.3.6 是同线小版本, 不会引入 Kotlin 不匹配。
+KSP_MIN_OK = "2.3.6"
+
 # META-INF 里几样 release 用不到的东西。
 # 说明白收益: DebugProbesKt.bin 是 kotlinx-coroutines 的调试探针, 只有
 # DebugProbes.install() 那种 IDE 协程调试才需要, 撑死 1~2 KB; 许可证文本同理。
@@ -366,6 +376,34 @@ PACKAGING_16KB = (
     "        }\n"
     "    }\n"
 )
+
+
+def _ver_tuple(v):
+    """把 "2.3.5" 变成 (2, 3, 5) 以便比较。非数字段按 0 处理。"""
+    parts = []
+    for seg in re.split(r'[.\-]', v):
+        parts.append(int(seg) if seg.isdigit() else 0)
+    return tuple(parts) or (0,)
+
+
+def patch_ksp_version(s):
+    """把 KSP 升到 2.3.6 以上, 消除 #2763 的 AWT NPE 噪音。纯函数, 不落盘。
+
+    只在"当前版本更低"时才升, 不反向降级 —— 上游哪天自己升到 2.4.x 了,
+    这里不能把人拉回 2.3.6。
+    """
+    m = re.search(r'(?m)^ksp\s*=\s*"([^"]*)"', s)
+    if not m:
+        return s, 0          # commons 侧可能压根没有 ksp, 正常
+    cur = m.group(1)
+    if _ver_tuple(cur) >= _ver_tuple(KSP_MIN_OK):
+        log("KSP 已是 %s (>= %s), 无需升级" % (cur, KSP_MIN_OK))
+        return s, 0
+    s2, k = re.subn(r'(?m)^(ksp\s*=\s*)"[^"]*"', r'\1"%s"' % KSP_MIN_OK, s)
+    if k:
+        log("KSP %s -> %s (修掉 #2763: AWT 后台线程的 NPE, 构建日志里那片红字)"
+            % (cur, KSP_MIN_OK))
+    return s2, k
 
 
 def patch_android16(root, sdk=ANDROID_16_SDK):
@@ -400,6 +438,7 @@ def patch_android16(root, sdk=ANDROID_16_SDK):
     # patch_sdk_align 那步会跳过降级, 而这里刚把 compileSdk 改成 36,
     # 不补这一刀就会留下 "lifecycle 2.11.0 + compileSdk 36" 的致命组合。
     s, _kl = pin_lifecycle(s, sdk)
+    s, _kk = patch_ksp_version(s)
     if s != orig:
         write(p, s)
         log("Android 16: min/target/compile 三档 SDK 已全部钉为 %s (%d 处)" % (sdk, n))
@@ -1967,6 +2006,37 @@ def patch_google_trim(root):
 
 # ------------------------------------------------------------------ 10. 改包名
 DEFAULT_OLD_PKG = "com.goodwy.smsmessenger"
+DEFAULT_NEW_PKG = "com.android.messages"
+
+# 这些前缀是保留命名空间, 用了会有麻烦, 但脚本只警告不阻止 ——
+# 自用/开源深度定制场景下用户可能就是想要, 拦下来属于越权。
+#
+# 为什么 com.android.* 有风险, 说清楚:
+#   1) Google Play 官方明确禁止: "Both the com.example and com.android
+#      namespaces are forbidden by Google Play" —— 上商店 100% 被拒。
+#   2) 部分 ROM 的包安装器会拒绝安装 com.android.* 开头的第三方 APK。
+#      有实测案例: 包名用 com.android.simple 时 adb install 正常, 但点 APK
+#      安装报"应用未安装", 改掉包名后恢复。所以装不上时先换 adb install 试。
+#   3) com.example 同理被 Play 禁止。
+# 注意: AOSP 原生短信应用的包名是 com.android.messaging (单数, 没有 s),
+# 和这里的 com.android.messages (复数) 不冲突, 不会装不上。
+RESERVED_PKG_PREFIXES = (
+    ("com.android.", "Google Play 明令禁止; 部分 ROM 拒绝安装, 且易与系统应用混淆"),
+    ("com.example.", "Google Play 明令禁止的示例命名空间"),
+    ("com.google.", "属于 Google 的命名空间, 非官方应用不得使用"),
+    ("android.", "Android 平台 API 命名空间, 第三方不可用"),
+    ("java.", "Java 平台命名空间, 会导致类加载冲突"),
+)
+
+
+def _warn_reserved_pkg(pkg):
+    for prefix, why in RESERVED_PKG_PREFIXES:
+        if pkg.startswith(prefix):
+            warn("包名 %r 以保留前缀 %r 开头: %s" % (pkg, prefix, why))
+            warn("  自用/开源定制可以继续, 但请注意: 上传到 Google Play 会被拒; "
+                 "若设备安装时报'应用未安装', 改用 adb install 再试")
+            return True
+    return False
 
 
 def patch_package(root, new_pkg, old_pkg=DEFAULT_OLD_PKG):
@@ -1985,6 +2055,8 @@ def patch_package(root, new_pkg, old_pkg=DEFAULT_OLD_PKG):
     if not re.match(r'^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$', new_pkg):
         warn("包名 %r 格式不合法, 跳过改名" % new_pkg)
         return
+
+    _warn_reserved_pkg(new_pkg)
 
     log("改名: %s -> %s" % (old_pkg, new_pkg))
     n_files = 0
@@ -2595,9 +2667,11 @@ def main():
                     help="不限制 ABI (默认只保留 arm64-v8a)")
     ap.add_argument("--no-device-trim", action="store_true",
                     help="不精简非手机设备资源与低密度位图")
-    ap.add_argument("--package-name", default=None,
-                    help="改包名, 如 com.mycompany.sms (默认不改, 保持 "
-                         "com.goodwy.smsmessenger)")
+    ap.add_argument("--package-name", default=DEFAULT_NEW_PKG,
+                    help="改包名 (默认改成 %s; 传 --keep-package 保持原包名 "
+                         "com.goodwy.smsmessenger)" % DEFAULT_NEW_PKG)
+    ap.add_argument("--keep-package", action="store_true",
+                    help="保持原包名 com.goodwy.smsmessenger 不做修改")
     ap.add_argument("--no-purchase-trim", action="store_true",
                     help="保留「购买 Thank You」卡片与「小费罐」(默认删除)")
     ap.add_argument("--no-google-trim", action="store_true",
@@ -2680,7 +2754,7 @@ def main():
             patch_other_group(root)
         if not a.keep_speech:
             patch_speech_app(root)
-        if a.package_name:
+        if not a.keep_package and a.package_name:
             patch_package(root, a.package_name)
         patch_app_version(root, a.commons_version)
         patch_app_force_format(root, a.date_format)
