@@ -319,14 +319,18 @@ jobs:
           fi
           echo "=== 构建产物 ==="
           find app/build/outputs/apk -name "*.apk" -print
-          # KSP 2.3.5 的已知 bug: 处理结束后, IntelliJ PSI 的后台清理线程
-          # (AWT-EventQueue-0) 在 Application 已销毁后仍去取服务, 抛 NPE。
-          # 抛在 AWT 线程而非构建主线程, Gradle 捕获不到, 不影响产物 ——
-          # 官方 issue google/ksp#2763 标题即 "does not break build"。
-          # 这里不静默吞掉, 只标注清楚, 免得每次看到红字都以为是新问题。
+          # KSP 2.3.5 的已知 bug(google/ksp#2763): 处理结束后 IntelliJ PSI 的
+          # 后台清理线程(AWT-EventQueue-0)在 Application 已销毁后仍去取服务,
+          # 抛 NPE。抛在 AWT 线程, Gradle 捕获不到, 不影响产物, 但红字一片。
+          # 官方已在 2.3.6 修掉, patch_android16 会自动把 ksp 升上去。
+          # 这里只做验收: 升完还出现, 就说明没升成功, 值得看一眼。
+          echo "--- 实际生效的 KSP 版本 ---"
+          grep -E '^ksp = ' gradle/libs.versions.toml || echo "(未找到)"
           if grep -q 'ApplicationManager.getApplication()' build.log; then
-            echo "::notice::检测到 KSP 已知非致命异常 (google/ksp#2763): 抛在 AWT "
-            echo "         后台线程, 不影响 APK。彻底消除需等 KSP 升到 2.3.5 以上。"
+            echo "::warning::仍出现 KSP #2763 的 AWT NPE —— 说明 KSP 没升到 2.3.6,"
+            echo "          检查 patch_android16 是否执行、libs.versions.toml 里 ksp 键名是否变了"
+          else
+            echo "KSP AWT NPE (#2763): 未出现, 已消除"
           fi
 
       - name: Sign APK
