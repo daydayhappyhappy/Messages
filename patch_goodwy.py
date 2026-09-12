@@ -302,15 +302,105 @@ def patch_sdk_align(root, sdk):
     s, k2 = re.subn(r'(?m)^(app-build-targetSDK\s*=\s*)"[^"]*"',
                     r'\1"%s"' % sdk, s)
 
-    if int(sdk) < 37:
-        s, k3 = re.subn(r'(?m)^(androidx-lifecycle\s*=\s*)"[^"]*"',
-                        r'\1"2.10.0"', s)
-        if k3:
-            log("commons: androidx-lifecycle 压回 2.10.0 (2.11.0 要求 compileSdk>=37)")
-
+    s, _k3 = pin_lifecycle(s, sdk)
     if s != orig:
         write(p, s)
         log("commons: compileSdk/targetSdk 已对齐为 %s" % sdk)
+
+
+def pin_lifecycle(s, sdk):
+    """compileSdk < 37 时把 androidx-lifecycle 压回 2.10.0。纯函数, 不落盘。
+
+    必须做成可单独调用的一步, 而不是嵌在 patch_sdk_align 里:
+    patch_android16 跑在 patch_sdk_align 之后(它负责最终拍板 SDK 数值),
+    若 --compile-sdk 传进来的是 37, patch_sdk_align 会跳过降级(37 不需要压),
+    接着 patch_android16 把数值改成 36, 于是留下 lifecycle 2.11.0 +
+    compileSdk 36 的组合 —— 正是 CheckAarMetadata 失败的那个组合。
+    所以拍板完 SDK 之后必须再压一次, 而不是只压一次。
+    """
+    if int(sdk) >= 37:
+        return s, 0
+    s2, k = re.subn(r'(?m)^(androidx-lifecycle\s*=\s*)"[^"]*"',
+                    r'\1"2.10.0"', s)
+    # 只在真变了时才打日志: patch_sdk_align 和 patch_android16 都会调它,
+    # 第二次进来时值已经是 2.10.0, 再报一次"已压回"纯属噪音。
+    if k and s2 != s:
+        log("commons: androidx-lifecycle 压回 2.10.0 (2.11.0 要求 compileSdk>=37)")
+    return s2, k
+
+
+# --------------------------------------------- Android 16 (API 36) 定向优化
+ANDROID_16_SDK = "36"
+
+# min / target / compile 三档在 gradle/libs.versions.toml 里的键名
+SDK_KEYS = ("app-build-compileSDKVersion", "app-build-targetSDK",
+            "app-build-minimumSDK")
+
+# Android 16 起 Google Play 强制支持 16KB 内存页: so 必须页对齐且不压缩。
+# AGP 需要显式关掉 legacy packaging(默认压缩 so)才会按 16KB 对齐打包。
+PACKAGING_16KB = (
+    "    packaging {\n"
+    "        jniLibs {\n"
+    "            // Android 16: 16KB 页大小要求 so 不压缩且页对齐\n"
+    "            useLegacyPackaging = false\n"
+    "        }\n"
+    "    }\n"
+)
+
+
+def patch_android16(root, sdk=ANDROID_16_SDK):
+    """把 min / target / compile 三档 SDK 全部钉到 Android 16 (API 36)。
+
+    为什么值得单独做这一步:
+      - minSdk 26 -> 36 后, R8 能确定 `Build.VERSION.SDK_INT >= XX` 全是常量,
+        所有为 Android 8~15 写的兼容分支会被整体剪掉 —— APK 更小、运行更快,
+        而且这是编译器自动做的, 不需要(也不应该)手工去删那些 if。
+      - target/compile 上游已经是 36, 这一步主要是兜底: 万一上游升到 37,
+        会把 lifecycle 等依赖一起拖到要求 compileSdk>=37, app 侧解析 AAR 就
+        会 CheckAarMetadata 失败(这个坑之前踩过), 钉死 36 可避免。
+      - commons 的 minSdk 不能高于 app, 否则 manifest merger 报错, 所以两侧
+        都钉同一个值最省事。
+
+    代价: 装不上 Android 16 以下的设备。使用者只跑 Android 16, 无需兼容。
+    """
+    n = 0
+    p = os.path.join(root, "gradle", "libs.versions.toml")
+    if not os.path.exists(p):
+        warn("找不到 gradle/libs.versions.toml, 跳过 Android 16 定向优化")
+        return
+    s = read(p)
+    orig = s
+    for key in SDK_KEYS:
+        s, k = re.subn(r'(?m)^(%s\s*=\s*)"[^"]*"' % re.escape(key),
+                       r'\1"%s"' % sdk, s)
+        if not k:
+            warn("libs.versions.toml 里没有 %s, 请确认键名" % key)
+        n += k
+    # 钉完最终数值后再压一次 lifecycle: 若 --compile-sdk 传的是 37,
+    # patch_sdk_align 那步会跳过降级, 而这里刚把 compileSdk 改成 36,
+    # 不补这一刀就会留下 "lifecycle 2.11.0 + compileSdk 36" 的致命组合。
+    s, _kl = pin_lifecycle(s, sdk)
+    if s != orig:
+        write(p, s)
+        log("Android 16: min/target/compile 三档 SDK 已全部钉为 %s (%d 处)" % (sdk, n))
+
+    # 16KB 页大小只有最终打 APK 的 app 模块需要; commons 是 library, 没有 app 目录
+    gb = os.path.join(root, "app", "build.gradle.kts")
+    if not os.path.exists(gb):
+        return
+    s = read(gb)
+    if "useLegacyPackaging" in s:
+        log("build.gradle.kts: 已有 16KB 打包配置, 跳过")
+        return
+    span = fun_span(s, r'android\s*\{')
+    if not span:
+        warn("build.gradle.kts: 未定位到 android 块, 跳过 16KB 页大小配置")
+        return
+    j = span[1]
+    head = s[:j]
+    ins = PACKAGING_16KB if head.endswith("\n") else "\n" + PACKAGING_16KB
+    write(gb, head + ins + s[j:])
+    log("build.gradle.kts: 已启用 16KB 页大小对齐 (Android 16 强制要求)")
 
 
 def patch_ispro_always_true(root):
@@ -445,6 +535,21 @@ def patch_baseconfig(root, fmt, a_unlock_pro=True):
         r'(var appSideloadingStatus: Int\s*\n\s*get\(\)\s*=\s*)[^\n]*',
         r'\1SIDELOADING_FALSE', src)
 
+    # 6) 应用主题默认「系统默认」(Material You) 而不是浅色。
+    #    自定义外观页的当前主题由 getCurrentThemeId() 推导, 它第一个看的
+    #    就是 isSystemThemeEnabled —— 官方把默认值写成 false(原本的 isSPlus()
+    #    被注释掉了), 于是全新安装一律落到 THEME_LIGHT 浅色。
+    #
+    #    写死 true(而不是 isSPlus()): 目标机是 Android 16, 用不上低版本兼容。
+    #    代价说清楚 —— setupThemes() 只在 isSPlus() 时 put(THEME_SYSTEM),
+    #    所以在 Android 12 以下这台"系统默认"项不会出现在选项表里,
+    #    getThemeText() 会退化显示「自定义」。不会崩, 只是低版本上这项无意义。
+    #    另外预置默认值只在 prefs 里没写入过时才生效, 老用户升级不受影响。
+    src, k6 = re.subn(
+        r'(var isSystemThemeEnabled: Boolean\s*\n\s*get\(\)\s*=\s*'
+        r'prefs\.getBoolean\(IS_SYSTEM_THEME_ENABLED,\s*)[^\n)]*',
+        r'\1true', src)
+
     if src != orig:
         write(path, src)
     if k1:
@@ -465,6 +570,11 @@ def patch_baseconfig(root, fmt, a_unlock_pro=True):
         log("BaseConfig.kt: appSideloadingStatus 恒为 SIDELOADING_FALSE (签名认证弹窗关闭)")
     else:
         warn("BaseConfig.kt: 未匹配到 appSideloadingStatus")
+    if k6:
+        log("BaseConfig.kt: isSystemThemeEnabled 默认 true (应用主题默认跟随系统, "
+            "而非浅色)")
+    else:
+        warn("BaseConfig.kt: 未匹配到 isSystemThemeEnabled, 应用主题默认仍是浅色")
 
 
 FULL_BODY = '''
@@ -1723,10 +1833,18 @@ def _fix_style_value(v):
 
 
 def patch_italic(root):
-    """把应用内所有斜体改回默认正体:
-       XML: android:textStyle="italic" / "bold|italic" / <item name="android:textStyle">italic</item>
-       KT : Typeface.ITALIC / Typeface.BOLD_ITALIC"""
-    n_xml = n_item = n_kt = 0
+    """把应用内所有斜体改回默认正体。四种写法, 缺一就是"改了但没改干净":
+
+      XML 属性: android:textStyle="italic" / "bold|italic"
+      style item: <item name="android:textStyle">italic</item>
+      传统 View: Typeface.ITALIC / Typeface.BOLD_ITALIC
+      Compose  : TextStyle(fontStyle = FontStyle.Italic)   <- 上一版漏的就是这个
+
+    Compose 那条最容易漏: 它既不是 XML 属性也不含 "textStyle" 字样,
+    只在 ManageBlockedNumbersScreen 这类纯 Compose 页面里出现,
+    而那些页面恰恰是设置里最显眼的空列表提示文案。
+    """
+    n_xml = n_item = n_kt = n_compose = 0
 
     for p in walk_files(root, (".xml",)):
         try:
@@ -1753,14 +1871,47 @@ def patch_italic(root):
         orig = s
         s = s.replace("Typeface.BOLD_ITALIC", "Typeface.BOLD")
         s, k = re.subn(r'\bTypeface\.ITALIC\b', 'Typeface.NORMAL', s)
+        n_kt += k
+        # Compose: 换成 Normal 而不是删掉 fontStyle= —— FontStyle 的 import
+        # 还得留着(Normal 仍要用), 而且 TextStyle(...) 少一个具名参数不会报错,
+        # 但显式写 Normal 更清楚, 也避免将来有人再加回 Italic。
+        s, kc = re.subn(r'\bFontStyle\.Italic\b', 'FontStyle.Normal', s)
+        n_compose += kc
         if s != orig:
             write(p, s)
-            n_kt += k
 
-    log("斜体 -> 正体: XML 属性 %d 处, style item %d 处, Kotlin Typeface %d 处"
-        % (n_xml, n_item, n_kt))
-    if n_xml + n_item + n_kt == 0:
+    log("斜体 -> 正体: XML 属性 %d 处, style item %d 处, "
+        "Kotlin Typeface %d 处, Compose FontStyle %d 处"
+        % (n_xml, n_item, n_kt, n_compose))
+    if n_xml + n_item + n_kt + n_compose == 0:
         warn("一处斜体都没匹配到 —— 如果该版本确实有斜体, 请检查是否被写成自定义 font 或 span")
+
+    _fold_dead_branches(root)
+
+
+# 只吃"同一行内、两分支字面量完全相同"的 if —— 形如
+#   if (conversation.isScheduled) Typeface.BOLD else Typeface.BOLD
+# 这是斜体改造留下的: 原本靠 BOLD_ITALIC 区分定时短信, 斜体改成 BOLD 后
+# 两个分支就相等了。恒等于 X, 折叠掉纯属等价化简。
+# 不碰跨行、不碰 else if 链、不碰分支里带调用/花括号的, 避免误判语义。
+DEAD_BRANCH_RX = re.compile(
+    r'\bif\s*\((?:[^()]|\([^()]*\))*\)\s*([A-Za-z_][A-Za-z0-9_.]*)\s+else\s+\1\b')
+
+
+def _fold_dead_branches(root):
+    n = 0
+    for p in walk_files(root, (".kt", ".java")):
+        try:
+            s = read(p)
+        except Exception:
+            continue
+        new, k = DEAD_BRANCH_RX.subn(lambda m: m.group(1), s)
+        if k:
+            write(p, new)
+            n += k
+    if n:
+        log("死分支折叠: %d 处 if/else 两分支相同 -> 直接取该值" % n)
+    return n
 
 
 # ------------------------------------------------------------------ 5. 依赖 / 构建环境
@@ -2086,6 +2237,10 @@ def main():
     ap.add_argument("--no-trim-langs", action="store_true")
     ap.add_argument("--no-locale-filters", action="store_true")
     ap.add_argument("--no-italic-fix", action="store_true")
+    ap.add_argument("--no-android16", action="store_true",
+                    help="不把 min/target/compile 钉到 Android 16 (API 36)。"
+                         "默认开启: 装不上 Android 16 以下的设备, 换取 R8 剪掉"
+                         "所有低版本兼容分支")
     ap.add_argument("--no-strip-about", action="store_true")
     ap.add_argument("--keep-settings-about", action="store_true",
                     help="保留设置页里的「关于」入口 (默认一并去掉)")
@@ -2131,6 +2286,10 @@ def main():
         patch_commons_version(root, a.commons_version)
         if a.compile_sdk:
             patch_sdk_align(root, a.compile_sdk)
+        if not a.no_android16:
+            # 放在 patch_sdk_align 之后: 即便 --compile-sdk 传了别的值,
+            # 最终仍以 Android 16 为准
+            patch_android16(root)
         if not a.no_unlock_pro:
             patch_ispro_always_true(root)
             if not a.keep_purchase_page:
@@ -2158,6 +2317,8 @@ def main():
     else:
         log("=== patch app (%s) ===" % os.path.basename(root.rstrip("/")))
         patch_local_properties(root, os.environ.get("ANDROID_HOME"))
+        if not a.no_android16:
+            patch_android16(root)
         if not a.no_google_trim:
             patch_google_trim(root)
         if not a.no_purchase_trim:
