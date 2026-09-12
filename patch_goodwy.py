@@ -97,12 +97,26 @@ def _mask(src):
     return pat.sub(blank, src)
 
 
+def _anchored(sig_pattern):
+    """给签名正则加上"行首 + 修饰符"前缀。已加过就原样返回 —— 必须幂等。
+
+    幂等这条不能省: _stub_fun 会先自己加前缀做"块体/表达式体"判断,
+    再把加过前缀的 pattern 交给 replace_fun_body -> fun_span。如果 fun_span
+    认不出它已经加过, 就会再拼一遍, 于是正则里出现第二个 (?m) 且不在开头:
+      - Python 3.12: 直接 re.error "global flags not at the start", CI 当场挂
+      - Python 3.10: 只给一条 DeprecationWarning, 本地跑得好好的
+    这个"本地通过、CI 炸"的差异整整浪费了一轮构建, 所以幂等要写在这里。
+    """
+    if sig_pattern.startswith("^") or sig_pattern.startswith("(?m)"):
+        return sig_pattern
+    # 只允许行首到 fun 之间是空白和修饰符, 保证命中真函数而不是注释/字符串
+    return r"(?m)^[ \t]*" + MODIFIERS + sig_pattern
+
+
 def fun_span(src, sig_pattern):
     """按签名定位函数体: 返回 (body_start, body_end)。
     body_start 是 '{' 的下标, body_end 是配对的 '}' 的下标。"""
-    if not sig_pattern.startswith("^"):
-        # 只允许行首到 fun 之间是空白和修饰符, 保证命中真函数而不是注释/字符串
-        sig_pattern = r"(?m)^[ \t]*" + MODIFIERS + sig_pattern
+    sig_pattern = _anchored(sig_pattern)
     msk = _mask(src)
     m = re.search(sig_pattern, msk)
     if not m:
@@ -231,8 +245,7 @@ def drop_branch(src, cond):
 def drop_fun(src, sig_pattern):
     """整段删除一个顶层函数(含签名与函数体), 用于移除波斯历分支函数。
     返回 (new_src, ok)。"""
-    if not sig_pattern.startswith("^"):
-        sig_pattern = r"(?m)^[ \t]*" + MODIFIERS + sig_pattern
+    sig_pattern = _anchored(sig_pattern)
     msk = _mask(src)
     m = re.search(sig_pattern, msk)
     if not m:
@@ -825,8 +838,7 @@ def _stub_fun(src, sig_pattern, body):
     遇到 `fun x() = someCall { ... }` 这种表达式体, 它会把后面某个不相干的
     块当成函数体, 整段替换掉 —— 属于改一个词毁一个文件的灾难。
     """
-    if not sig_pattern.startswith("^"):
-        sig_pattern = r"(?m)^[ \t]*" + MODIFIERS + sig_pattern
+    sig_pattern = _anchored(sig_pattern)
     msk = _mask(src)
     m = re.search(sig_pattern, msk)
     if not m or msk[m.end() - 1] != "(":
@@ -2035,6 +2047,30 @@ def patch_final_clean(root, new_pkg=None):
 
 
 # ------------------------------------------------------------------ main
+def _preflight():
+    """开跑前用一秒钟验证所有签名正则能编译、且 _anchored 幂等。
+
+    存在的理由: 这类正则拼装错误在 Python 3.10 上只是 DeprecationWarning
+    (本地跑得好好的), 到 3.12 才变成 re.error(构建机直接挂), 也就是说
+    只有提交到 CI 才发现 —— 一轮构建几十分钟。这里提前炸, 成本一秒。
+    """
+    pats = [p for p, _ in SPEECH_STUBS] + [
+        r'private fun setupUseSpeechToText\(',
+        r'fun Context\.isPro\(\)',
+        r'fun Long\.formatDateOrTime\(',
+        r'init\s*\{',
+    ]
+    for p in pats:
+        once = _anchored(p)
+        try:
+            re.compile(once)
+            re.compile(_anchored(once))      # 二次前缀也必须能编译
+        except re.error as e:
+            warn("签名正则无法编译: %r -> %s" % (p, e))
+            sys.exit(2)
+    log("自检: %d 个签名正则编译通过" % len(pats))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("target", choices=["commons", "app"])
@@ -2083,6 +2119,7 @@ def main():
     a.abi_trim = not a.no_abi_trim
     a.device_trim = not a.no_device_trim
 
+    _preflight()
     root = a.root
     if not os.path.isdir(root):
         log("目录不存在: %s" % root)
