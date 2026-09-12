@@ -240,8 +240,17 @@ jobs:
           grep -A2 '@+id/about' app/src/main/res/menu/menu_main.xml || echo "(已移除)"
           echo "=== [4] 剩余语言目录 ==="
           ls app/src/main/res | grep '^values' | tr '\n' ' ' || true; echo
-          echo "=== [5] 残留斜体(应为空) ==="
-          grep -rn 'textStyle="italic"\|Typeface.ITALIC\|>italic<' app/src --include=*.xml --include=*.kt | head -10 || echo "(无残留)"
+          echo "=== [5] 残留斜体(应为空: XML属性/Typeface/Compose FontStyle 全覆盖) ==="
+          grep -rn 'textStyle="italic"\|Typeface\.ITALIC\|FontStyle\.Italic' \
+            app/src "$RUNNER_TEMP/commons" --include=*.xml --include=*.kt \
+            | grep -v detekt-baseline | head -10 || echo "(无残留)"
+          echo "=== [5b] 应用主题默认值(应为 true: 跟随系统, 而非浅色) ==="
+          if grep -A1 'var isSystemThemeEnabled' "$CM/helpers/BaseConfig.kt" \
+             | grep -q 'IS_SYSTEM_THEME_ENABLED, true'; then
+            echo "OK: 默认跟随系统 (Material You)"
+          else
+            echo "(仍是浅色, 检查 patch_baseconfig 第 6 项)"
+          fi
           echo "=== [6] ABI 过滤 ==="
           grep -A2 'abiFilters' app/build.gradle.kts || echo "(未生效)"
           echo "=== [7] 非手机资源目录(应为空) ==="
@@ -274,6 +283,13 @@ jobs:
           grep -A2 'fun Activity.isSpeechToTextAvailable' \
             "$RUNNER_TEMP/commons/commons/src/main/kotlin/com/goodwy/commons/extensions/Activity.kt" \
             || echo "(未找到, 检查路径)"
+          echo "=== [18] Android 16 三档 SDK(应全为 36) ==="
+          grep -E 'app-build-(compileSDKVersion|targetSDK|minimumSDK)' \
+            gradle/libs.versions.toml
+          echo "=== [19] lifecycle(compileSdk 36 下必须是 2.10.0) ==="
+          grep -E 'androidx-lifecycle' gradle/libs.versions.toml || echo "(未找到)"
+          echo "=== [20] 16KB 页大小(Android 16 强制) ==="
+          grep -A2 'useLegacyPackaging' app/build.gradle.kts || echo "(未启用)"
 
       - name: Build release APK
         run: |
