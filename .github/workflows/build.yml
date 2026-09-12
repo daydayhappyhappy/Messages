@@ -265,8 +265,8 @@ jobs:
           echo "=== [14] 内购文案残留(应为空: 内容已被清空) ==="
           grep -rE '<string name="[^"]*(purchase|thank_you|tip_jar|tipjar|donate|donation)[^"]*">[^<]+<' \
             "$RUNNER_TEMP/commons" app/src/main/res 2>/dev/null || echo "(已全部清空)"
-          echo "=== [15] 付费渠道源集(应已删除) ==="
-          ls -d app/src/gplay app/src/rustore 2>/dev/null || echo "(已删除, 只剩 foss)"
+          echo "=== [15] 付费渠道源集(保留无害: 不参与 foss 构建, 不进 APK) ==="
+          ls -d app/src/gplay app/src/rustore 2>/dev/null || echo "(无 gplay/rustore 源集)"
 
       - name: Build release APK
         run: |
@@ -279,7 +279,21 @@ jobs:
           # 三个渠道的 KSP 会并发写同一个 app/schemas/*.json, 互相读半截内容会报
           # "Expected end of the object ...". 只构建单渠道 + 清掉历史残留即可避开。
           rm -rf app/schemas
-          ./gradlew "$TASK" --no-daemon --no-parallel --stacktrace
+          # 编译失败时 Gradle 会甩出上百行 worker 栈, 真正有用的 Kotlin 报错
+          # (e: 文件:行:列: ...) 被埋在最底下。这里 tee 一份, 失败时单独抽出来打,
+          # 免得每次都要在几千行栈里捞那几行。
+          set +e
+          ./gradlew "$TASK" --no-daemon --no-parallel --stacktrace 2>&1 | tee build.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "::group::编译错误明细 (Kotlin)"
+            grep -E '^e: ' build.log | sort -u | head -40 || echo "(未抓到 e: 行, 见下方 what went wrong)"
+            echo "--- what went wrong ---"
+            grep -A8 'What went wrong' build.log | head -20 || true
+            echo "::endgroup::"
+            exit "$RC"
+          fi
           echo "=== 构建产物 ==="
           find app/build/outputs/apk -name "*.apk" -print
 
