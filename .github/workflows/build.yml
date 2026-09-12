@@ -355,6 +355,58 @@ jobs:
           "${BT}aapt2" dump badging RightMessages-custom.apk \
             | grep -iE 'vending\.BILLING|billingclient' || echo "(无 BILLING 权限, 可被开源商店收录)"
 
+      - name: APK 体积构成
+        run: |
+          set -e
+          APK=RightMessages-custom.apk
+          [ -f "$APK" ] || { echo "没有 APK 可分析"; exit 0; }
+          echo "总大小: $(du -h "$APK" | cut -f1)"
+          python3 - "$APK" <<'PY'
+          import sys, zipfile, collections, os
+          z = zipfile.ZipFile(sys.argv[1])
+          infos = z.infolist()
+          tot = sum(i.file_size for i in infos)
+          ctot = sum(i.compress_size for i in infos)
+          print("\n=== 按类型汇总 (原始 / 压缩后) ===")
+          agg = collections.defaultdict(lambda: [0, 0])
+          for i in infos:
+              n = i.filename
+              if n.startswith("lib/"):
+                  k = "lib/*.so (原生库)"
+              elif n.startswith("classes") and n.endswith(".dex"):
+                  k = "classes*.dex (代码)"
+              elif n == "resources.arsc":
+                  k = "resources.arsc (资源表)"
+              elif n.startswith("res/"):
+                  k = "res/ (资源文件)"
+              elif n.startswith("assets/"):
+                  k = "assets/"
+              elif n.startswith("META-INF/"):
+                  k = "META-INF/ (签名/元数据)"
+              elif n == "AndroidManifest.xml":
+                  k = "AndroidManifest.xml"
+              else:
+                  k = "其它"
+              agg[k][0] += i.file_size
+              agg[k][1] += i.compress_size
+          for k, (a, b) in sorted(agg.items(), key=lambda x: -x[1][0]):
+              print("  %-26s %8.1f MB  (压缩后 %8.1f MB)" % (k, a/1048576, b/1048576))
+          print("  %-26s %8.1f MB  (压缩后 %8.1f MB)" % ("合计", tot/1048576, ctot/1048576))
+          print("\n=== 体积 Top 12 ===")
+          for i in sorted(infos, key=lambda x: -x.file_size)[:12]:
+              r = "" if not i.file_size else "  压缩率 %d%%" % (100 - i.compress_size*100/i.file_size)
+              print("  %7.2f MB  %s%s" % (i.file_size/1048576, i.filename, r))
+          print("\n=== 未压缩条目(STORED) ===")
+          st = [i for i in infos if i.compress_type == 0]
+          if st:
+              for i in sorted(st, key=lambda x: -x.file_size)[:8]:
+                  print("  %7.2f MB  %s" % (i.file_size/1048576, i.filename))
+              print("  (共 %d 个, 合计 %.1f MB) —— 未压缩条目会被对齐填充放大"
+                    % (len(st), sum(i.file_size for i in st)/1048576))
+          else:
+              print("  (无)")
+          PY
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
