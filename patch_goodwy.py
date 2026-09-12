@@ -1771,48 +1771,70 @@ PAY_NAME_KEYS = ("purchase", "thank_you", "thankyou", "tip_jar", "tipjar",
                  "become_", "pro_version", "unlock_pro")
 
 
-def _clean_sideload_calls(root):
-    """把签名/侧载认证的调用点整体替换成 Unit (定义行 / import / 注释不动)。
+# 只吃"整行就是一个调用"的独立语句, 前面最多带 if (...) / else 守卫。
+# 为什么这么保守: `foo(showSideloadingDialog())` 换成 foo(Unit) 会类型不匹配,
+# 直接编不过; `return showSideloadingDialog()` 同理。宁可漏, 不可错 ——
+# 漏掉的调用点无害: BaseConfig 恒 FALSE + 弹窗 init 直接 callback +
+# Compose 版空壳, 三道保险已把它们变成空操作。
+SIDELOAD_STMT_RX = re.compile(
+    r'[ \t]*(?:(?:if\s*\((?:[^()]|\([^()]*\))*\)|else)[ \t]*)?'
+    r'(?P<call>(?:[A-Za-z_][A-Za-z0-9_]*\s*\((?:[^()]|\([^()]*\))*\)\s*\.\s*)?'
+    r'(?:' + '|'.join(SIDELOAD_FUNCS) + r')\s*\((?:[^()]|\([^()]*\))*\))'
+    r'[ \t]*;?[ \t]*$')
 
-    注意: 不能去动 fun 定义本身 —— 上一版就是把
-    `fun Activity.showSideloadingDialog() {` 注释掉一半, 编出语法错误,
-    白跑一整轮 CI。这里只吃"调用", 定义原样留着。
-    """
-    total, files = 0, 0
+
+def _sideload_calls_left(root):
+    """统计剩下的调用点(排除 fun 定义行), 用于报告漏网。"""
+    n = 0
     for p in walk_files(root, (".kt", ".java")):
         try:
-            out = read(p)
+            mlines = _mask(read(p)).split("\n")
         except Exception:
             continue
-        msk = _mask(out)
-        hits = []
-        for m in SIDELOAD_CALL_RX.finditer(msk):
-            ls = msk.rfind("\n", 0, m.start()) + 1
-            le = msk.find("\n", m.end())
-            if le < 0:
-                le = len(msk)
-            line = out[ls:le]
-            if re.search(r'\bfun\b', line):         # 函数定义, 一律不碰
-                continue
-            if line.strip().startswith(("import", "//", "*", "/*")):
-                continue
-            hits.append((m, le))
-        if not hits:
+        n += sum(1 for ml in mlines
+                 if SIDELOAD_CALL_RX.search(ml) and not re.search(r'\bfun\b', ml))
+    return n
+
+
+def _clean_sideload_calls(root):
+    """把签名/侧载认证的独立语句调用整体替换成 Unit。
+
+    逐行匹配而不是全文 finditer: _mask 只把非换行字符换成空格, 行结构与
+    原文严格对齐, 所以拿 mask 行定位、回原文行切片替换是安全的 —— 注释和
+    字符串里的同名调用天然被 mask 掉, 函数定义行则因为尾部还有 " {" 而
+    匹配不上 (上一版就是注释定义行写坏成 `fun Activity.// ... {`, 编译期才炸)。
+    """
+    before = _sideload_calls_left(root)
+    done, files = 0, 0
+    for p in walk_files(root, (".kt", ".java")):
+        try:
+            src = read(p)
+        except Exception:
             continue
-        # 倒序替换: 后改的不影响前面的下标, 一次遍历即可, 不用反复 _mask
-        for m, le in reversed(hits):
-            tail = out[m.end():le].strip()
-            # 同行后面还有代码就别加行注释, 否则把后面的代码一起吃掉
-            repl = "Unit  // 签名认证已移除" if tail in ("", ";") else "Unit"
-            out = out[:m.start()] + repl + out[m.end():]
-        write(p, out)
-        total += len(hits)
-        files += 1
-    if total:
-        log("收尾: 签名/侧载认证调用点已置空 %d 处 (%d 个文件)" % (total, files))
+        lines = src.split("\n")
+        mlines = _mask(src).split("\n")
+        hit = False
+        for i, ml in enumerate(mlines):
+            m = SIDELOAD_STMT_RX.match(ml)
+            if not m:
+                continue
+            s, e = m.start("call"), m.end("call")
+            lines[i] = lines[i][:s] + "Unit  // 签名认证已移除" + lines[i][e:]
+            hit = True
+            done += 1
+        if hit:
+            write(p, "\n".join(lines))
+            files += 1
+    if done:
+        log("收尾: 签名/侧载认证调用点已置空 %d 处 (%d 个文件)" % (done, files))
     else:
-        log("收尾: 未发现签名/侧载认证调用点 (只剩函数定义)")
-    return total
+        log("收尾: 未发现独立的签名/侧载认证调用点")
+    left = _sideload_calls_left(root)
+    if left:
+        warn("收尾: 仍有 %d 处调用点嵌在表达式里(参数/返回值), 未改动以免类型不匹配"
+             % left)
+    log("收尾: 调用点 %d -> 剩余 %d" % (before, left))
+    return done
 
 
 def _clean_billing_manifest(root):
@@ -1879,31 +1901,6 @@ def _clean_payment_strings(root):
     return total
 
 
-def _drop_paid_flavors(root):
-    """删掉 gplay / rustore 两个付费渠道的源集 (只在 app 侧调)。
-
-    只构建 foss, 这两个目录永远不参与编译; 但它们是内购代码的老巢
-    (BillingHelper、gplay 版 PurchaseActivity、带 BILLING 的 manifest)。
-    留在源码树里, 任何源码级扫描都会说"这应用带内购"。
-    注意: 不要对 commons 做这件事 —— commons 的 gplay 源集可能提供被 main
-    源集引用的符号(如 isProVersion 的实现), 删了大概率编不过; 而它按
-    flavor 发布, 本来也进不了 foss 的 AAR。
-    """
-    targets = []
-    for dp, dn, fn in os.walk(root):
-        dn[:] = [d for d in dn if d not in (".git", "build", ".gradle", ".idea")]
-        if os.path.basename(dp) == "src":
-            targets += [os.path.join(dp, d) for d in dn if d in ("gplay", "rustore")]
-    for t in targets:
-        shutil.rmtree(t, ignore_errors=True)
-    if targets:
-        log("收尾: 已删除付费渠道源集 %s"
-            % ", ".join(rel(root, t) for t in targets))
-    else:
-        log("收尾: 未发现 gplay/rustore 源集")
-    return len(targets)
-
-
 def _report_pkg_leftover(root, new_pkg, old_pkg=DEFAULT_OLD_PKG):
     """改包名后复查: 全仓还有没有旧包名的漏网之鱼。
 
@@ -1928,20 +1925,22 @@ def _report_pkg_leftover(root, new_pkg, old_pkg=DEFAULT_OLD_PKG):
         log("改包名: 全仓已无 %s 残留" % old_pkg)
 
 
-def patch_final_clean(root, new_pkg=None, drop_flavors=False):
+def patch_final_clean(root, new_pkg=None):
     """收尾清理: 签名认证残留 + 内购痕迹, 一次清干净。
 
     顺序很关键, 必须排在最后:
       - 早于 patch_package, 改包名又会带出新的引用;
       - 早于 patch_res_languages, 刚清空的文案目录可能又被重建。
     commons 与 app 各调一次(commons 自带 strings 模块, 付费文案一大半在那)。
+
+    刻意不去删 gplay/rustore 源集: 它们的代码根本不会进 foss 的 APK,
+    开源商店扫的是 APK 而非源码树, 删了没有收益; 但 main 源集常常引用
+    只在付费 flavor 里定义的符号, 一删就是一堆 unresolved reference。
     """
     log("--- 收尾清理 (%s) ---" % os.path.basename(root.rstrip("/")))
     _clean_sideload_calls(root)
     _clean_billing_manifest(root)
     _clean_payment_strings(root)
-    if drop_flavors:
-        _drop_paid_flavors(root)
     _report_pkg_leftover(root, new_pkg)
 
 
@@ -2063,7 +2062,7 @@ def main():
             patch_device_res(root)
         if not a.no_italic_fix:
             patch_italic(root)
-        patch_final_clean(root, a.package_name, drop_flavors=True)
+        patch_final_clean(root, a.package_name)
 
     ok = verify_syntax(root)
     log("完成%s" % ("" if ok else " (但自检有问题, 见上面的 WARN)"))
