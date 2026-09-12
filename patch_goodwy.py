@@ -38,8 +38,41 @@ def read(p):
 
 
 def write(p, s):
+    """写文件, 带一道安全网: 不允许把一个原本配平的源码文件写成不配平。
+
+    为什么需要这道网: 脚本里到处是"按正则定位一段、整段删掉"的逻辑
+    (drop_fun / drop_branch / fun_span ...)。只要有一处 span 算错 —— 比如
+    找不到配对的 '}' 时一路走到文件末尾 —— 就会把文件从中间切断, 丢掉末尾
+    若干个 '}'。这种损坏编译期才炸, 而且报错指向文件末尾, 极难反推是哪一步。
+    实测就踩到过: SettingsActivity.kt 被截掉 5 个 '}', 直接编译失败。
+
+    规则: 原文件配平 -> 新内容也必须配平, 否则拒绝写入并 warn(宁可漏删)。
+          原文件本就不配平 -> 放行(不把已有问题算到这次头上)。
+    """
+    if _BRACKET_EXT.search(p) and os.path.exists(p):
+        try:
+            old = read(p)
+        except Exception:
+            old = None
+        if old is not None:
+            om, nm = _mask(old), _mask(s)
+            if _even(om) and not _even(nm):
+                warn("拒绝写入 %s: 改动会让括号不配平, 已放弃这次修改 "
+                     "(宁可漏删, 也不能输出编译不过的文件)" % rel(os.getcwd(), p))
+                return False
     with open(p, "w", encoding="utf-8") as f:
         f.write(s)
+    return True
+
+
+_BRACKET_EXT = re.compile(r'\.(kt|kts|java)$')
+
+
+def _even(msk):
+    """mask 后的文本括号是否配平。三对都查: {} () []"""
+    return (msk.count("{") == msk.count("}")
+            and msk.count("(") == msk.count(")")
+            and msk.count("[") == msk.count("]"))
 
 
 def rel(root, p):
