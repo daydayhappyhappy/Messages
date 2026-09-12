@@ -267,6 +267,13 @@ jobs:
             "$RUNNER_TEMP/commons" app/src/main/res 2>/dev/null || echo "(已全部清空)"
           echo "=== [15] 付费渠道源集(保留无害: 不参与 foss 构建, 不进 APK) ==="
           ls -d app/src/gplay app/src/rustore 2>/dev/null || echo "(无 gplay/rustore 源集)"
+          echo "=== [16] 语音输入残留(commons 已抽空, 残留不报错但需人工确认) ==="
+          grep -rn 'isSpeechToTextAvailable\|speechToText' app/src --include=*.kt \
+            | grep -vE 'useSpeechToText|UseSpeechToText' || echo "(app 侧已无引用)"
+          echo "=== [17] commons 语音函数(应为 return false / 空实现) ==="
+          grep -A2 'fun Activity.isSpeechToTextAvailable' \
+            "$RUNNER_TEMP/commons/commons/src/main/kotlin/com/goodwy/commons/extensions/Activity.kt" \
+            || echo "(未找到, 检查路径)"
 
       - name: Build release APK
         run: |
